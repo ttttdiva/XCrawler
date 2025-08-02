@@ -10,6 +10,36 @@ from twscrape import API, Tweet
 from dotenv import load_dotenv
 import aiohttp
 
+# twscrapeの200件制限を回避するためのパッチ
+import httpx
+from twscrape.models import Tweet as TweetModel, to_old_rep, _write_dump
+from typing import Generator
+
+def parse_tweets_unlimited(rep: httpx.Response, limit: int = -1) -> Generator[TweetModel, None, None]:
+    """
+    修正版parse_tweets関数 - 200件制限を回避
+    """
+    res = rep if isinstance(rep, dict) else rep.json()
+    obj = to_old_rep(res)
+    
+    ids = set()
+    for x in obj["tweets"].values():
+        # limitチェックを無効化（全ツイート返却）
+        try:
+            tmp = TweetModel.parse(x, obj)
+            if tmp.id not in ids:
+                ids.add(tmp.id)
+                yield tmp
+        except Exception as e:
+            _write_dump("tweet", e, x, obj)
+            continue
+
+# モンキーパッチ適用
+import twscrape.models
+import twscrape.api as twscrape_api
+twscrape.models.parse_tweets = parse_tweets_unlimited
+twscrape_api.parse_tweets = parse_tweets_unlimited
+
 
 class TwitterMonitor:
     def __init__(self, config: dict, db_manager=None):
@@ -69,15 +99,18 @@ class TwitterMonitor:
                     
                 username = f"twitter_user_{account_index}"
                 if username not in existing_usernames:
-                    # Cookie文字列形式に変換
-                    cookie_string = f"auth_token={token}; ct0={ct0}"
+                    # Cookie辞書形式で統一
+                    cookies = {
+                        "auth_token": token,
+                        "ct0": ct0
+                    }
                     
                     await self.api.pool.add_account(
                         username=username,
                         password="dummy_password",
                         email=f"dummy{account_index}@example.com",
                         email_password="dummy_email_password",
-                        cookies=cookie_string
+                        cookies=cookies
                     )
                     self.logger.info(f"Added Twitter account {account_index}")
                 else:
@@ -267,7 +300,7 @@ class TwitterMonitor:
             
             # Playwrightを使うべきか判定
             total_tweets = user.statusesCount
-            playwright_threshold = self.config['tweet_settings'].get('playwright_threshold', 300)
+            playwright_threshold = self.config['tweet_settings'].get('playwright_threshold', 700)
             playwright_enabled = self.config['tweet_settings'].get('playwright', {}).get('enabled', True)
             
             # Playwrightを使用する場合の判定
@@ -394,13 +427,13 @@ class TwitterMonitor:
             
             # twscrapeのkvパラメータで日付フィルタリングを試験的に実装
             kv = None
-            if latest_tweet_date:
+            if latest_tweet_date and not force_full_fetch:
                 # ISO形式の日時文字列でフィルタリング（試験的）
                 kv = {"since_time": latest_tweet_date.isoformat()}
                 self.logger.debug(f"Trying to filter tweets with kv parameter: {kv}")
             
-            # force_full_fetchが有効な場合は制限を無視
-            limit = -1  # デフォルトは無制限
+            # limitの設定
+            limit = -1  # デフォルトは-1（無制限）
             if not force_full_fetch:
                 if latest_tweet_date and (datetime.now(timezone.utc) - latest_tweet_date).days < 7:
                     limit = 50  # 1週間以内に更新があった場合は50件まで
@@ -408,15 +441,14 @@ class TwitterMonitor:
                 elif latest_tweet_date and (datetime.now(timezone.utc) - latest_tweet_date).days < 30:
                     limit = 100  # 1ヶ月以内の場合は100件まで
                     self.logger.debug(f"Recent month update detected, limiting fetch to {limit} tweets")
-            else:
-                # force_full_fetchの場合は明示的に大きな値を設定
-                # Playwrightが無効の場合は閾値に関係なくtwscrapeで最大限取得
-                if not playwright_enabled:
-                    limit = 50000  # 5万件まで取得を試みる
-                    self.logger.info(f"Playwright disabled, using twscrape with limit {limit} tweets")
                 else:
-                    limit = 50000  # 5万件まで取得を試みる
-                    self.logger.info(f"Force full fetch enabled, setting limit to {limit} tweets")
+                    # 初回取得や古いデータの場合は無制限
+                    limit = -1
+                    self.logger.info(f"No recent updates, fetching all available tweets (limit=-1)")
+            else:
+                # force_full_fetchの場合は明示的に-1（無制限）を設定
+                limit = -1
+                self.logger.info(f"Force full fetch enabled, no limit set (fetching all available tweets)")
                 
                 # force_full_fetchの場合、kvパラメータをクリア（日付フィルタを無効化）
                 kv = None
@@ -425,7 +457,7 @@ class TwitterMonitor:
             # force_full_fetchの場合、アカウントプールの状態を定期的に確認
             check_interval = 500  # 500ツイートごとにチェック
             
-            async for tweet in self.api.user_tweets(user.id, limit=limit, kv=kv):
+            async for tweet in self.api.user_tweets(user.id):
                 total_fetched += 1
                 self.logger.debug(f"Tweet {total_fetched}: ID={tweet.id}, Date={tweet.date}, Username={getattr(tweet.user, 'username', 'N/A')}")
                 

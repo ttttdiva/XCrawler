@@ -33,7 +33,7 @@ tweet_settings:
   force_full_fetch: false
   
   # Playwright閾値（ツイート件数がこの件数を超える場合にPlaywrightを使用）
-  playwright_threshold: 300
+  playwright_threshold: 700
   
   # Playwright設定
   playwright:
