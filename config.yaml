@@ -1,0 +1,159 @@
+# EventMonitor設定ファイル
+
+# 監視対象アカウント（monitored_accounts.csvから読み込み）
+
+
+# LLMモデル設定（フォールバック順）
+models:
+  - "gemini-2.0-flash"       # 第1優先
+  - "gemini-2.5-flash"       # 第2優先
+  - "gemini-2.5-pro"         # 第3優先
+  - "gpt-4o"                 # 第4優先
+# データベース設定
+# SQLiteを使用
+database:
+  type: "sqlite"
+  path: "data/eventmonitor.db"
+
+# Discord通知設定
+discord:
+  # 通知内容の設定
+  notification:
+    mention_role: null  # @everyone, @here, または特定のロールID
+    embed_color: 0x1da1f2  # Twitter青
+
+# ツイート取得設定
+tweet_settings:
+  # 過去何日分のツイートを取得するか
+  days_lookback: 36500  # 1=1日
+  # リトライ設定
+  max_retries: 3
+  retry_delay: 60  # 秒
+  # 強制的に全ツイートを取得するか（効率化を無視）
+  force_full_fetch: false
+  
+  # Playwright閾値（ツイート件数がこの件数を超える場合にPlaywrightを使用）
+  playwright_threshold: 300
+  
+  # Playwright設定
+  playwright:
+    # Playwrightを使用するか（false: twscrapeのみで最大限取得）
+    enabled: false
+    # ヘッドレスモード（true: バックグラウンド実行、false: ブラウザ表示）
+    headless: true
+    # 全件取得モード（制限なし）
+    unlimited_mode: true
+    # 安全装置（最大取得件数 - 10万件で停止）
+    safety_limit: 100000
+    # 連続で新しいツイートが見つからない場合の停止回数
+    max_consecutive_no_new: 30
+
+# イベント判定設定
+event_detection:
+  # イベント検出機能を有効にするか（false: クローラーとしてのみ動作）
+  enabled: true
+  # イベント関連キーワード
+  keywords:
+    - "参加"
+    - "出展"
+    - "ブース"
+    - "スペース"
+    - "サークル"
+    - "新刊"
+    - "頒布"
+    - "委託"
+    - "イベント"
+    - "コミケ"
+    - "C102"
+    - "C103"
+    - "コミティア"
+    - "M3"
+    - "例大祭"
+    - "オンリー"
+    - "通販"
+    - "BOOTH"
+    - "メロンブックス"
+    - "とらのあな"
+
+  # 除外キーワード（これらが含まれる場合は通知しない）
+  exclude_keywords:
+    - "完売"
+    - "終了"
+
+# 画像管理設定
+image_settings:
+  # 古い画像の自動削除を有効にするか
+  cleanup_enabled: false
+  # 画像保持期間（日数）
+  retention_days: 30
+
+# Hugging Faceバックアップ設定
+huggingface_backup:
+  # バックアップを有効にするか
+  enabled: false
+  # リポジトリ名（HUGGINGFACE_REPO_NAME環境変数で上書き可能）
+  repo_name: "hf_tarou/XCrawler_1"
+  # 画像も含めるか
+  include_images: true
+  # rclone暗号化設定
+  rclone_encryption:
+    # 暗号化を有効にするか
+    enabled: true
+    # rclone設定ファイルのパス
+    config_path: "rclone.conf"
+    # 使用するrcloneリモート名
+    remote_name: "eventmonitor_crypt"
+  # レート制限時の待機をスキップするか（falseで適切に待機）
+  skip_rate_limit_wait: false
+
+
+# Hydrus Client連携設定
+hydrus:
+  # 連携を有効にするか
+  enabled: true
+  # Hydrus Client APIのURL
+  api_url: "http://127.0.0.1:45869"
+  # インポート設定
+  import_settings:
+    # イベント関連ツイートのみインポートするか
+    event_tweets_only: false
+    # 既存ファイルのスキップ（SHA256ハッシュで判定）
+    skip_existing: true
+  # タグ設定
+  tag_settings:
+    # 基本タグ（必ず付与）
+    base_tags:
+      - "source:twitter"
+      - "imported_by:eventmonitor"
+    # クリエイター名のタグ形式
+    creator_tag_format: "creator:{name}"
+    # イベント名のタグ形式
+    event_tag_format: "event:{name}"
+    # 日付タグを追加するか（デフォルト: false）
+    include_date_tag: false
+    # 日付タグの形式
+    # date_tag_format: "date:{date}"
+    # ツイートURLをタグとして追加するか（デフォルト: false）
+    include_tweet_url: false
+    # タイトルタグ（ツイート本文）を追加するか（デフォルト: true）
+    include_title_tag: true
+    # 検出されたキーワードをタグとして追加するか
+    # include_detected_keywords: true
+
+# システム設定
+system:
+  # ログレベル (DEBUG, INFO, WARNING, ERROR)
+  log_level: "DEBUG"
+  # データ保存ディレクトリ
+  data_dir: "data"
+  # 実行間隔（分）
+  check_interval: 60
+
+# ログ専用アカウント設定
+log_only_accounts:
+  # 機能を有効にするか
+  enabled: true
+  # アップロード後に画像を即削除するか
+  delete_after_upload: true
+  # 一度に処理するツイート数
+  batch_size: 50

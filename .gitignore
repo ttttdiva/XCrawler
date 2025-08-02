@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+.env.local
+
+# Database
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+logs/
+*.log
+images/
+videos/
+old/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Reference project (not to be pushed)
+40_caico-list-gen/
+45_huggingface_backup/
+../Hitomi-Downloader-temp/
+
+# Temporary files
+eventmonitor_encrypted_files/
+temp_upload/
+temp_images_backup/
+.rclone_temp/
+tmp/
