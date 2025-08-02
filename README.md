@@ -1,4 +1,4 @@
-# EventMonitor
+# XCrawler
 
 イベント参加の告知を見逃さないための自動監視・通知システム。  
 Twitter/Xアカウントのツイートを定期的に取得し、イベント関連のポストをAIで検出してDiscordに通知します。
@@ -17,7 +17,7 @@ python main.py --daemon
 
 ### 1. インストール
 ```bash
-git clone https://github.com/yourusername/XCrawler.git
+git clone https://github.com/ttttdiva/XCrawler.git
 cd XCrawler
 bash setup.sh
 ```
