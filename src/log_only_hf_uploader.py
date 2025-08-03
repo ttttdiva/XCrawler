@@ -4,22 +4,24 @@ import os
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any
-from huggingface_hub import HfApi, upload_file
+from huggingface_hub import HfApi, upload_file, create_repo
 import tempfile
 import aiohttp
 import asyncio
 import time
 import re
+import yaml
 from .rclone_client import RcloneClient, RcloneConfig
 
 
 class LogOnlyHFUploader:
     """ログ専用アカウント用のHugging Faceアップローダー"""
     
-    def __init__(self, config: dict, db_manager=None):
+    def __init__(self, config: dict, db_manager=None, backup_manager=None):
         self.config = config
         self.logger = logging.getLogger("EventMonitor.LogOnlyHF")
         self.db_manager = db_manager
+        self.backup_manager = backup_manager  # BackupManagerの参照を保持
         
         # レート制限対策の設定
         self.max_retries = 3
@@ -52,7 +54,7 @@ class LogOnlyHFUploader:
             
             # メインのバックアップ設定と同じリポジトリ名を使用
             hf_backup_config = config.get('huggingface_backup', {})
-            self.repo_name = os.getenv('HUGGINGFACE_REPO_NAME', hf_backup_config.get('repo_name', 'event-monitor-tweets'))
+            self.repo_name = hf_backup_config.get('repo_name', 'event-monitor-tweets')
             
             # ユーザー情報を取得
             user_info = self.api.whoami()
@@ -63,6 +65,9 @@ class LogOnlyHFUploader:
                 self.full_repo_name = f"{self.username}/{self.repo_name}"
             else:
                 self.full_repo_name = self.repo_name
+            
+            # 元のリポジトリ名を保存（番号なしのベース名）
+            self.base_repo_name = self._extract_base_repo_name(self.full_repo_name)
             
             self.logger.info(f"Initialized log-only HF uploader for {self.full_repo_name}")
             
@@ -98,7 +103,8 @@ class LogOnlyHFUploader:
                 # リポジトリが存在しない場合は作成
                 self.api.create_repo(
                     repo_id=self.full_repo_name,
-                    repo_type="dataset"
+                    repo_type="dataset",
+                    exist_ok=True  # 既存のリポジトリがあってもOK
                 )
                 self.logger.info(f"Created new dataset repository: {self.full_repo_name}")
                 
@@ -131,10 +137,175 @@ Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             self.logger.error(f"Failed to ensure repository exists: {e}")
             raise
     
+    def _extract_base_repo_name(self, repo_name: str) -> str:
+        """リポジトリ名から番号を除いたベース名を抽出"""
+        # 例: "Sageen/EventMonitor_1" → "Sageen/EventMonitor"
+        match = re.match(r'^(.+?)(_\d+)?$', repo_name)
+        if match:
+            return match.group(1)
+        return repo_name
+    
+    def _get_next_repo_name(self) -> str:
+        """現在のリポジトリ名から次の番号のリポジトリ名を生成"""
+        match = re.match(r'^(.+?)(?:_(\d+))?$', self.full_repo_name)
+        if match:
+            base_name = match.group(1)
+            current_num = int(match.group(2)) if match.group(2) else 1
+            return f"{base_name}_{current_num + 1}"
+        return f"{self.full_repo_name}_2"
+    
+    def _update_config_file(self, new_repo_name: str):
+        """config.yamlファイルを新しいリポジトリ名で更新"""
+        try:
+            config_path = Path('config.yaml')
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f)
+            
+            # リポジトリ名を更新
+            config['huggingface_backup']['repo_name'] = new_repo_name
+            
+            # ファイルに書き戻す
+            with open(config_path, 'w', encoding='utf-8') as f:
+                yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            
+            self.logger.info(f"Updated config.yaml with new repository: {new_repo_name}")
+        except Exception as e:
+            self.logger.error(f"Failed to update config.yaml: {e}")
+    
+    def _reload_repo_name_from_config(self):
+        """config.yamlから最新のリポジトリ名を再読み込み"""
+        try:
+            config_path = Path('config.yaml')
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f)
+            
+            new_repo_name = config.get('huggingface_backup', {}).get('repo_name', self.repo_name)
+            
+            # リポジトリ名が変更されていたら更新
+            if new_repo_name != self.repo_name:
+                self.logger.info(f"Repository name changed in config: {self.repo_name} -> {new_repo_name}")
+                self.repo_name = new_repo_name
+                
+                # フルリポジトリ名を再構築
+                if '/' not in self.repo_name:
+                    self.full_repo_name = f"{self.username}/{self.repo_name}"
+                else:
+                    self.full_repo_name = self.repo_name
+                
+                self.logger.info(f"Using updated repository: {self.full_repo_name}")
+        except Exception as e:
+            self.logger.error(f"Failed to reload config: {e}")
+    
+    async def process_downloaded_media(self, media_paths: Dict[str, List[str]], username: str):
+        """gallery-dlでダウンロード済みのメディアをHFにアップロード後削除
+        
+        Args:
+            media_paths: {tweet_id: [file_paths]} の辞書
+            username: Twitter username
+        """
+        if not self.enabled:
+            return
+        
+        # BackupManagerから最新のリポジトリ名を取得
+        if self.backup_manager and hasattr(self.backup_manager, 'full_repo_name'):
+            if self.backup_manager.full_repo_name != self.full_repo_name:
+                self.logger.info(f"Using BackupManager's repository: {self.backup_manager.full_repo_name}")
+                self.full_repo_name = self.backup_manager.full_repo_name
+        
+        total_files = sum(len(files) for files in media_paths.values())
+        self.logger.info(f"Processing {total_files} files from {len(media_paths)} tweets")
+        
+        processed_count = 0
+        failed_count = 0
+        
+        for tweet_id, file_paths in media_paths.items():
+            # DBから処理済みかチェック
+            if self.db_manager:
+                existing_urls = self.db_manager.get_log_only_tweet_hf_urls(tweet_id)
+                if existing_urls:
+                    self.logger.debug(f"Tweet {tweet_id} already uploaded to HF, skipping")
+                    # 既にアップロード済みなら、ファイルだけ削除
+                    for file_path in file_paths:
+                        try:
+                            Path(file_path).unlink()
+                            self.logger.debug(f"Deleted already-uploaded file: {file_path}")
+                        except Exception as e:
+                            self.logger.error(f"Failed to delete file {file_path}: {e}")
+                    continue
+            
+            hf_urls = []
+            for file_path in file_paths:
+                file_path = Path(file_path)
+                if not file_path.exists():
+                    self.logger.warning(f"File not found: {file_path}")
+                    continue
+                
+                try:
+                    # ファイル名から判定（動画か画像か）
+                    is_video = file_path.suffix.lower() in {'.mp4', '.mov', '.avi', '.webm', '.mkv', '.flv', '.wmv', 
+                                                            '.m4v', '.mpg', '.mpeg', '.3gp', '.3g2', '.ts', '.vob',
+                                                            '.ogv', '.f4v', '.asf', '.rm', '.rmvb', '.m2ts', '.mts',
+                                                            '.m3u8', '.m3u', '.gif', '.gifv'}
+                    
+                    # HFパスを決定
+                    if is_video:
+                        hf_path = f"encrypted_videos/{username}/{tweet_id}/{file_path.name}"
+                    else:
+                        hf_path = f"encrypted_images/{username}/{tweet_id}/{file_path.name}"
+                    
+                    # rclone暗号化が有効な場合
+                    upload_path = str(file_path)
+                    if self.rclone_client:
+                        encrypted_path = file_path.parent / f"{file_path.name}.enc"
+                        encrypted_path = self.rclone_client.encrypt_file(file_path, encrypted_path)
+                        if encrypted_path:
+                            upload_path = str(encrypted_path)
+                            hf_path += ".enc"
+                    
+                    # アップロード（リトライ機能付き）
+                    upload_success = await self._upload_with_retry(
+                        upload_path=upload_path,
+                        hf_path=hf_path
+                    )
+                    
+                    if upload_success:
+                        # HF URLを記録
+                        hf_url = f"https://huggingface.co/datasets/{self.full_repo_name}/resolve/main/{hf_path}"
+                        hf_urls.append(hf_url)
+                        processed_count += 1
+                        self.logger.debug(f"Uploaded and will delete: {file_path.name}")
+                        
+                        # 元ファイルを削除
+                        file_path.unlink()
+                        
+                        # 暗号化ファイルがある場合も削除
+                        if self.rclone_client and upload_path != str(file_path):
+                            Path(upload_path).unlink()
+                    else:
+                        failed_count += 1
+                        self.logger.error(f"Failed to upload {file_path.name}")
+                        
+                except Exception as e:
+                    self.logger.error(f"Error processing {file_path}: {e}")
+                    failed_count += 1
+            
+            # DBにHF URLを保存
+            if self.db_manager and hf_urls:
+                self.db_manager.update_log_only_tweet_hf_urls(tweet_id, hf_urls)
+                self.logger.debug(f"Updated DB for tweet {tweet_id} with {len(hf_urls)} URLs")
+        
+        self.logger.info(f"Completed: {processed_count} uploaded, {failed_count} failed")
+    
     async def process_tweets(self, tweets: List[Dict[str, Any]], username: str) -> List[Dict[str, Any]]:
         """ツイートの画像をダウンロード、HFにアップロード、URLを更新"""
         if not self.enabled:
             return tweets
+        
+        # BackupManagerから最新のリポジトリ名を取得
+        if self.backup_manager and hasattr(self.backup_manager, 'full_repo_name'):
+            if self.backup_manager.full_repo_name != self.full_repo_name:
+                self.logger.info(f"Using BackupManager's repository: {self.backup_manager.full_repo_name}")
+                self.full_repo_name = self.backup_manager.full_repo_name
         
         processed_tweets = []
         
@@ -192,8 +363,29 @@ Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         async with aiohttp.ClientSession() as session:
             for i, media_url in enumerate(tweet.get('media', [])):
                 try:
-                    # ファイル名を生成
-                    ext = media_url.split('.')[-1].split('?')[0]
+                    # ファイル名を生成（URLパラメータを除去）
+                    # URLからファイル名部分を抽出
+                    if '/' in media_url:
+                        file_part = media_url.split('/')[-1]
+                    else:
+                        file_part = media_url
+                    
+                    # パラメータを除去（?format=jpg&name=orig など）
+                    if '?' in file_part:
+                        file_part = file_part.split('?')[0]
+                    
+                    # 拡張子を判定
+                    if '.' in file_part:
+                        ext = file_part.split('.')[-1]
+                    else:
+                        # 拡張子がない場合はjpgをデフォルトとする
+                        ext = 'jpg'
+                    
+                    # 有効な画像拡張子かチェック
+                    valid_image_extensions = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp']
+                    if ext.lower() not in valid_image_extensions:
+                        ext = 'jpg'  # 不明な拡張子の場合はjpgをデフォルト
+                    
                     filename = f"{tweet['id']}_{i}.{ext}"
                     local_path = temp_dir / filename
                     
@@ -257,11 +449,28 @@ Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         async with aiohttp.ClientSession() as session:
             for i, video_url in enumerate(tweet.get('videos', [])):
                 try:
-                    # ファイル名を生成（拡張子を適切に判断）
-                    if '.m3u8' in video_url:
+                    # ファイル名を生成（URLパラメータを除去）
+                    # URLからファイル名部分を抽出
+                    if '/' in video_url:
+                        file_part = video_url.split('/')[-1]
+                    else:
+                        file_part = video_url
+                    
+                    # パラメータを除去
+                    if '?' in file_part:
+                        file_part = file_part.split('?')[0]
+                    
+                    # 拡張子を判定
+                    if '.m3u8' in file_part:
                         ext = 'm3u8'
-                    elif '.gif' in video_url:
+                    elif '.gif' in file_part:
                         ext = 'gif'
+                    elif '.' in file_part:
+                        ext = file_part.split('.')[-1]
+                        # 有効な動画拡張子かチェック
+                        valid_video_extensions = ['mp4', 'mov', 'avi', 'webm', 'mkv', 'flv', 'wmv', 'm4v', 'gif', 'm3u8']
+                        if ext.lower() not in valid_video_extensions:
+                            ext = 'mp4'  # 不明な拡張子の場合はmp4をデフォルト
                     else:
                         ext = 'mp4'  # デフォルト
                     
@@ -321,6 +530,41 @@ Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         return hf_urls
     
     
+    def _handle_file_limit_and_create_new_repo(self) -> bool:
+        """ファイル上限エラーを処理し、新しいリポジトリに切り替え"""
+        self.logger.warning(f"Repository {self.full_repo_name} has reached file limit")
+        
+        # 次のリポジトリ名を生成
+        new_repo_name = self._get_next_repo_name()
+        self.logger.info(f"Switching to new repository: {new_repo_name}")
+        
+        # config.yamlを更新
+        self._update_config_file(new_repo_name)
+        
+        # 新しいリポジトリ名を設定
+        self.full_repo_name = new_repo_name
+        
+        # BackupManagerの変数も更新
+        if self.backup_manager and hasattr(self.backup_manager, 'full_repo_name'):
+            self.backup_manager.full_repo_name = new_repo_name
+            self.logger.info(f"Updated BackupManager's repository to: {new_repo_name}")
+        
+        # 新しいリポジトリを作成
+        try:
+            create_repo(
+                self.full_repo_name,
+                token=self.api.token,
+                repo_type="dataset"
+            )
+            self.logger.info(f"Created new dataset repository: {self.full_repo_name}")
+            
+            # 少し待機
+            time.sleep(2)
+            return True
+        except Exception as create_error:
+            self.logger.error(f"Failed to create new repository: {create_error}")
+            return False
+    
     def _handle_upload_error(self, error: Exception) -> tuple[bool, float]:
         """アップロードエラーを処理し、待機時間を返す
         
@@ -328,6 +572,12 @@ Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             tuple[bool, float]: (リトライすべきか, 待機時間(秒))
         """
         error_msg = str(error)
+        
+        # ファイル数上限エラーをチェック
+        if "over the limit of 100000 files" in error_msg:
+            if self._handle_file_limit_and_create_new_repo():
+                return True, 2.0  # 新しいリポジトリでリトライ
+            return False, 0
         
         # レート制限エラーをチェック (429 Too Many Requests)
         if "429" in error_msg and "Too Many Requests" in error_msg:

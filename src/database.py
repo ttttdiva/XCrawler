@@ -182,6 +182,44 @@ class DatabaseManager:
         finally:
             session.close()
     
+    def save_single_tweet(self, tweet_data: Dict[str, Any], username: str) -> bool:
+        """単一ツイートをall_tweetsテーブルに保存"""
+        session = self._get_session()
+        
+        try:
+            # 既存チェック
+            existing = session.query(AllTweets).filter(
+                AllTweets.id == tweet_data['id']
+            ).first()
+            
+            if existing:
+                return False
+            
+            # 新規レコードを作成
+            tweet_record = AllTweets(
+                id=tweet_data['id'],
+                username=username,
+                display_name=tweet_data.get('display_name', username),
+                tweet_text=tweet_data['text'],
+                tweet_date=datetime.fromisoformat(tweet_data['date'].replace('Z', '+00:00')),
+                tweet_url=tweet_data['url'],
+                media_urls=json.dumps(tweet_data.get('media', [])),
+                local_media=json.dumps(tweet_data.get('local_media', [])),
+                huggingface_urls=json.dumps(tweet_data.get('huggingface_urls', [])),
+                checked_for_event=False
+            )
+            
+            session.add(tweet_record)
+            session.commit()
+            return True
+            
+        except SQLAlchemyError as e:
+            session.rollback()
+            self.logger.error(f"Database error in save_single_tweet: {e}")
+            return False
+        finally:
+            session.close()
+    
     def save_all_tweets(self, tweets: List[Dict[str, Any]], username: str) -> int:
         """全ツイートをall_tweetsテーブルに保存"""
         session = self._get_session()
@@ -479,6 +517,43 @@ class DatabaseManager:
         finally:
             session.close()
     
+    def save_single_log_only_tweet(self, tweet_data: Dict[str, Any], username: str) -> bool:
+        """単一ツイートをlog_only_tweetsテーブルに保存"""
+        session = self._get_session()
+        
+        try:
+            # 既存チェック
+            existing = session.query(LogOnlyTweet).filter(
+                LogOnlyTweet.id == tweet_data['id']
+            ).first()
+            
+            if existing:
+                return False
+            
+            # 新規レコードを作成
+            tweet_record = LogOnlyTweet(
+                id=tweet_data['id'],
+                username=username,
+                display_name=tweet_data.get('display_name', username),
+                tweet_text=tweet_data['text'],
+                tweet_date=datetime.fromisoformat(tweet_data['date'].replace('Z', '+00:00')),
+                tweet_url=tweet_data['url'],
+                media_urls=json.dumps(tweet_data.get('media', [])),
+                huggingface_urls=json.dumps(tweet_data.get('huggingface_urls', [])),
+                uploaded_to_hf=tweet_data.get('uploaded_to_hf', False)
+            )
+            
+            session.add(tweet_record)
+            session.commit()
+            return True
+            
+        except SQLAlchemyError as e:
+            session.rollback()
+            self.logger.error(f"Database error in save_single_log_only_tweet: {e}")
+            return False
+        finally:
+            session.close()
+    
     def save_log_only_tweets(self, tweets: List[Dict[str, Any]], username: str) -> int:
         """ログ専用ツイートをlog_only_tweetsテーブルに保存"""
         session = self._get_session()
@@ -518,6 +593,42 @@ class DatabaseManager:
             session.rollback()
             self.logger.error(f"Database error in save_log_only_tweets: {e}")
             return 0
+        finally:
+            session.close()
+    
+    def get_tweet_hf_urls(self, tweet_id: str) -> List[str]:
+        """all_tweetsテーブルからHugging Face URLを取得"""
+        session = self._get_session()
+        
+        try:
+            tweet = session.query(AllTweets).filter(
+                AllTweets.id == tweet_id
+            ).first()
+            
+            if tweet and tweet.huggingface_urls:
+                return json.loads(tweet.huggingface_urls)
+            return []
+        except Exception as e:
+            self.logger.error(f"Failed to get HF URLs for tweet {tweet_id}: {e}")
+            return []
+        finally:
+            session.close()
+    
+    def get_log_only_tweet_hf_urls(self, tweet_id: str) -> List[str]:
+        """ログ専用ツイートのHugging Face URLを取得"""
+        session = self._get_session()
+        
+        try:
+            tweet = session.query(LogOnlyTweet).filter(
+                LogOnlyTweet.id == tweet_id
+            ).first()
+            
+            if tweet and tweet.huggingface_urls:
+                return json.loads(tweet.huggingface_urls)
+            return []
+        except Exception as e:
+            self.logger.error(f"Failed to get HF URLs for log-only tweet {tweet_id}: {e}")
+            return []
         finally:
             session.close()
     

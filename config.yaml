@@ -85,7 +85,7 @@ image_settings:
 huggingface_backup:
   # バックアップを有効にするか
   enabled: false
-  # リポジトリ名（HUGGINGFACE_REPO_NAME環境変数で上書き可能）
+  # リポジトリ名（config.yamlで設定）
   repo_name: "hfusername/XCrawler_1"
   # 画像も含めるか
   include_images: true

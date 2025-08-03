@@ -41,7 +41,7 @@ class BackupManager:
                 return
                 
             self.api = HfApi(token=token)
-            self.repo_name = os.getenv('HUGGINGFACE_REPO_NAME', self.backup_config.get('repo_name', 'event-monitor-tweets'))
+            self.repo_name = self.backup_config.get('repo_name', 'event-monitor-tweets')
             
             # ユーザー情報を取得
             user_info = self.api.whoami()
@@ -287,8 +287,80 @@ class BackupManager:
             self.logger.error(f"Failed to ensure repository exists: {e}")
             raise
     
-    async def backup_tweets(self, new_tweets: List[Dict[str, Any]]):
-        """新規ツイートのメディアをHugging Faceにバックアップ"""
+    async def backup_tweet_and_save(self, tweet: Dict[str, Any], username: str, is_log_only: bool = False) -> bool:
+        """単一ツイートのメディアをHugging Faceにバックアップし、成功したらDBに保存
+        
+        Args:
+            tweet: バックアップ対象のツイート
+            username: ユーザー名
+            is_log_only: Trueの場合log_only_tweetsテーブル、Falseの場合all_tweetsテーブル
+            
+        Returns:
+            bool: 処理成功の場合True
+        """
+        if not self.backup_config.get('enabled', False):
+            # バックアップ無効の場合はDBに保存だけして成功とする
+            if self.db_manager:
+                if is_log_only:
+                    return self.db_manager.save_single_log_only_tweet(tweet, username)
+                else:
+                    return self.db_manager.save_single_tweet(tweet, username)
+            return True
+            
+        try:
+            tweet_id = tweet.get('id')
+            hf_urls = []
+            
+            # メディアのアップロード（画像・動画）
+            if tweet.get('local_media'):
+                for media_path in tweet['local_media']:
+                    media_file = Path(media_path)
+                    if media_file.exists():
+                        # パスからメディアタイプを判定（images/ or videos/）
+                        if 'videos/' in str(media_file):
+                            media_type = 'video'
+                        else:
+                            media_type = 'image'  # images/またはその他
+                        
+                        hf_url = await self._upload_file_with_retry(media_file, media_type)
+                        if hf_url:
+                            hf_urls.append(hf_url)
+                        else:
+                            # 1つでもアップロード失敗したら全体を失敗とする
+                            self.logger.error(f"Failed to upload media for tweet {tweet_id}")
+                            return False
+            
+            # HF URLsをツイートデータに追加
+            tweet['huggingface_urls'] = hf_urls
+            
+            # DBに保存
+            if self.db_manager:
+                if is_log_only:
+                    saved = self.db_manager.save_single_log_only_tweet(tweet, username)
+                else:
+                    saved = self.db_manager.save_single_tweet(tweet, username)
+                
+                if not saved:
+                    self.logger.error(f"Failed to save tweet {tweet_id} to database")
+                    return False
+                    
+                # DB保存成功後にHF URLsを更新
+                if hf_urls:
+                    self._update_tweet_hf_urls_batch(tweet_id, hf_urls, is_log_only=is_log_only)
+            
+            return True
+                
+        except Exception as e:
+            self.logger.error(f"Backup failed for tweet {tweet.get('id')}: {e}")
+            return False
+    
+    async def backup_tweets(self, new_tweets: List[Dict[str, Any]], is_log_only: bool = False):
+        """新規ツイートのメディアをHugging Faceにバックアップ
+        
+        Args:
+            new_tweets: バックアップ対象のツイート
+            is_log_only: Trueの場合log_only_tweetsテーブル、Falseの場合all_tweetsテーブル
+        """
         if not self.backup_config.get('enabled', False):
             return
             
@@ -309,14 +381,11 @@ class BackupManager:
                     for media_path in tweet['local_media']:
                         media_file = Path(media_path)
                         if media_file.exists():
-                            # 拡張子からメディアタイプを判定
-                            file_ext = media_file.suffix.lower()
-                            if file_ext in ['.jpg', '.jpeg', '.png', '.gif']:
-                                media_type = 'image'
-                            elif file_ext in ['.mp4', '.mov', '.avi', '.webm', '.m3u8']:
+                            # パスからメディアタイプを判定（images/ or videos/）
+                            if 'videos/' in str(media_file):
                                 media_type = 'video'
                             else:
-                                media_type = 'image'  # デフォルト
+                                media_type = 'image'  # images/またはその他
                             
                             hf_url = await self._upload_file_with_retry(media_file, media_type)
                             if hf_url:
@@ -325,9 +394,9 @@ class BackupManager:
                             else:
                                 failed_count += 1
                 
-                # データベースのHuggingFace URLsを更新
+                # データベースのHuggingFace URLsを更新（is_log_onlyパラメータを渡す）
                 if hf_urls and tweet_id:
-                    self._update_tweet_hf_urls_batch(tweet_id, hf_urls)
+                    self._update_tweet_hf_urls_batch(tweet_id, hf_urls, is_log_only=is_log_only)
             
             self.logger.info(f"Uploaded {uploaded_count} media files for {len(new_tweets)} tweets ({failed_count} failed)")
                 
@@ -443,7 +512,7 @@ class BackupManager:
     async def _upload_remaining_from_db(self):
         """データベースから未アップロード分を取得して処理"""
         try:
-            from .database import AllTweets, LogOnlyTweet
+            from .database import AllTweets
             import json
             import asyncio
             
@@ -460,30 +529,16 @@ class BackupManager:
                 (AllTweets.huggingface_urls == '[]')
             )
             
-            # log_only_tweetsテーブルでも同様に取得
-            log_only_query = session.query(LogOnlyTweet).filter(
-                LogOnlyTweet.media_urls.isnot(None),
-                LogOnlyTweet.media_urls != '',
-                LogOnlyTweet.media_urls != '[]'
-            ).filter(
-                (LogOnlyTweet.huggingface_urls.is_(None)) | 
-                (LogOnlyTweet.huggingface_urls == '') | 
-                (LogOnlyTweet.huggingface_urls == '[]')
-            )
-            
             unprocessed_all_tweets = all_tweets_query.all()
-            unprocessed_log_tweets = log_only_query.all()
             
             all_count = len(unprocessed_all_tweets)
-            log_count = len(unprocessed_log_tweets)
-            total_count = all_count + log_count
             
-            if total_count == 0:
+            if all_count == 0:
                 self.logger.info("No unprocessed media found in database")
                 session.close()
                 return
             
-            self.logger.info(f"Found {all_count} all_tweets and {log_count} log_only_tweets with unprocessed media")
+            self.logger.info(f"Found {all_count} all_tweets with unprocessed media")
             
             processed_count = 0
             
@@ -511,7 +566,7 @@ class BackupManager:
                     processed_count += 1
                     
                     if processed_count % 10 == 0:
-                        self.logger.info(f"Processed {processed_count}/{total_count} tweets")
+                        self.logger.info(f"Processed {processed_count}/{all_count} tweets")
                         
                     # レート制限対策
                     await asyncio.sleep(0.1)
@@ -520,100 +575,12 @@ class BackupManager:
                     self.logger.error(f"Failed to process all_tweet {tweet.id}: {e}")
                     continue
             
-            # log_only_tweetsの処理
-            for tweet in unprocessed_log_tweets:
-                try:
-                    media_urls = json.loads(tweet.media_urls) if tweet.media_urls else []
-                    if not media_urls:
-                        continue
-                    
-                    # tweet_dataとして再構築（log_only_tweets用）
-                    tweet_data = {
-                        'id': tweet.id,
-                        'username': tweet.username,
-                        'display_name': tweet.display_name,
-                        'text': tweet.tweet_text,
-                        'date': tweet.tweet_date.isoformat(),
-                        'url': tweet.tweet_url,
-                        'media': media_urls,
-                        'local_media': []  # log_onlyはメディアを保存しないので空
-                    }
-                    
-                    # log_only専用の簡易アップロード処理
-                    await self._process_log_only_remaining(tweet_data)
-                    processed_count += 1
-                    
-                    if processed_count % 10 == 0:
-                        self.logger.info(f"Processed {processed_count}/{total_count} tweets")
-                        
-                    # レート制限対策
-                    await asyncio.sleep(0.1)
-                    
-                except Exception as e:
-                    self.logger.error(f"Failed to process log_only_tweet {tweet.id}: {e}")
-                    continue
-            
             session.close()
             self.logger.info(f"Completed processing {processed_count} tweets from database")
             
         except Exception as e:
             self.logger.error(f"Failed to upload remaining from DB: {e}")
             raise
-    
-    async def _process_log_only_remaining(self, tweet_data: Dict[str, Any]):
-        """log_only_tweetsの未アップロード分を処理（画像ダウンロード→アップロード→即削除）"""
-        try:
-            import tempfile
-            import aiohttp
-            
-            tweet_id = tweet_data['id']
-            media_urls = tweet_data.get('media', [])
-            hf_urls = []
-            
-            if not media_urls:
-                return
-            
-            # 一時ディレクトリで処理
-            with tempfile.TemporaryDirectory() as temp_dir:
-                temp_path = Path(temp_dir)
-                
-                # 画像をダウンロード
-                async with aiohttp.ClientSession() as session:
-                    for i, media_url in enumerate(media_urls):
-                        try:
-                            async with session.get(media_url) as response:
-                                if response.status == 200:
-                                    file_ext = 'jpg'  # デフォルト
-                                    if 'content-type' in response.headers:
-                                        content_type = response.headers['content-type']
-                                        if 'png' in content_type:
-                                            file_ext = 'png'
-                                        elif 'gif' in content_type:
-                                            file_ext = 'gif'
-                                        elif 'webp' in content_type:
-                                            file_ext = 'webp'
-                                    
-                                    temp_file = temp_path / f"{tweet_id}_{i}.{file_ext}"
-                                    with open(temp_file, 'wb') as f:
-                                        f.write(await response.read())
-                                    
-                                    # HuggingFaceにアップロード
-                                    hf_url = await self._upload_file_with_retry(temp_file, 'image')
-                                    if hf_url:
-                                        hf_urls.append(hf_url)
-                                        self.logger.debug(f"Uploaded log_only image: {hf_url}")
-                                    
-                        except Exception as e:
-                            self.logger.error(f"Failed to process log_only media {media_url}: {e}")
-                            continue
-            
-            # データベースを更新
-            if hf_urls:
-                self.db_manager.update_log_only_tweet_hf_urls(tweet_id, hf_urls)
-                self.logger.debug(f"Updated {len(hf_urls)} HF URLs for log_only tweet {tweet_id}")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to process log_only remaining tweet {tweet_data.get('id')}: {e}")
     
     async def _upload_images(self):
         """画像と動画をアップロード（rclone暗号化対応）"""
@@ -762,15 +729,24 @@ class BackupManager:
         except Exception as e:
             self.logger.error(f"Failed to update tweet HF URLs: {e}")
     
-    def _update_tweet_hf_urls_batch(self, tweet_id: str, hf_urls: List[str]):
-        """複数のHuggingFace URLを一度に更新"""
+    def _update_tweet_hf_urls_batch(self, tweet_id: str, hf_urls: List[str], is_log_only: bool = False):
+        """複数のHuggingFace URLを一度に更新
+        
+        Args:
+            tweet_id: ツイートID
+            hf_urls: HuggingFace URLs
+            is_log_only: Trueの場合log_only_tweetsテーブル、Falseの場合all_tweetsテーブル
+        """
         try:
             import pysqlite3 as sqlite3
             conn = sqlite3.connect('data/eventmonitor.db')
             cursor = conn.cursor()
             
+            # テーブル名を決定
+            table_name = 'log_only_tweets' if is_log_only else 'all_tweets'
+            
             # 既存のURLsを取得
-            cursor.execute('SELECT huggingface_urls FROM all_tweets WHERE id = ?', (tweet_id,))
+            cursor.execute(f'SELECT huggingface_urls FROM {table_name} WHERE id = ?', (tweet_id,))
             result = cursor.fetchone()
             
             existing_urls = []
@@ -783,15 +759,15 @@ class BackupManager:
                     existing_urls.append(url)
             
             # データベースを更新
-            cursor.execute('UPDATE all_tweets SET huggingface_urls = ? WHERE id = ?', 
+            cursor.execute(f'UPDATE {table_name} SET huggingface_urls = ? WHERE id = ?', 
                          (json.dumps(existing_urls), tweet_id))
             conn.commit()
             conn.close()
             
-            self.logger.debug(f"Updated {len(hf_urls)} HF URLs for tweet {tweet_id}")
+            self.logger.debug(f"Updated {len(hf_urls)} HF URLs for tweet {tweet_id} in {table_name}")
             
         except Exception as e:
-            self.logger.error(f"Failed to update tweet HF URLs batch: {e}")
+            self.logger.error(f"Failed to update tweet HF URLs batch in {table_name}: {e}")
     
     async def _upload_file_with_retry(self, file_path: Path, file_type: str, max_retries: int = 3) -> Optional[str]:
         """ファイルをアップロード（3回まで再試行、レート制限対応）"""

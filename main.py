@@ -40,7 +40,8 @@ class EventMonitor:
         self.discord_notifier = DiscordNotifier(self.config)
         self.backup_manager = BackupManager(self.config, self.db_manager)
         self.hydrus_client = HydrusClient(self.config.get('hydrus', {}))
-        self.log_only_uploader = LogOnlyHFUploader(self.config, self.db_manager)
+        # backup_managerを参照として渡す
+        self.log_only_uploader = LogOnlyHFUploader(self.config, self.db_manager, self.backup_manager)
         
     def _load_config(self, config_path: str) -> dict:
         """設定ファイルを読み込む"""
@@ -184,9 +185,9 @@ class EventMonitor:
                         for tweet in new_tweets:
                             tweet['local_media'] = []
                     
-                    # 3. データベースに保存（huggingface_urls=[]で初期化）
-                    all_saved = self.db_manager.save_all_tweets(new_tweets, username)
-                    self.logger.info(f"Saved {all_saved} tweets to all_tweets table for @{username}")
+                    # 3. 一時的にツイートを保持（後でHFアップロード成功分のみDB保存）
+                    # all_saved = self.db_manager.save_all_tweets(new_tweets, username)
+                    # self.logger.info(f"Saved {all_saved} tweets to all_tweets table for @{username}")
                     
                     # 4. Hydrus連携（event_tweets_onlyがfalseの場合、全ツイートを対象）
                     self.logger.info(f"Hydrus enabled: {self.hydrus_client.enabled}")
@@ -276,15 +277,29 @@ class EventMonitor:
                         else:
                             self.logger.info(f"Event detection is disabled for @{username}, skipping LLM analysis")
                     
-                    # 6. HuggingFaceバックアップ処理（全ての重要な処理が完了した後）
+                    # 6. HuggingFaceバックアップ処理と同時にDB保存（1ツイートずつ）
+                    saved_count = 0
+                    failed_count = 0
+                    
+                    # リポジトリの存在確認
                     if self.backup_manager.backup_config.get('enabled', False):
+                        self.backup_manager._ensure_repo_exists()
+                    
+                    for tweet in new_tweets:
                         try:
-                            self.logger.info(f"Starting HuggingFace backup for {len(new_tweets)} tweets from @{username}")
-                            await self.backup_manager.backup_tweets(new_tweets)
-                            self.logger.info(f"HuggingFace backup completed for @{username}")
+                            # HFアップロード＆DB保存（成功時のみ）
+                            success = await self.backup_manager.backup_tweet_and_save(tweet, username, is_log_only=False)
+                            if success:
+                                saved_count += 1
+                                self.logger.debug(f"Successfully processed tweet {tweet['id']}")
+                            else:
+                                failed_count += 1
+                                self.logger.warning(f"Failed to process tweet {tweet['id']}")
                         except Exception as e:
-                            self.logger.error(f"HuggingFace backup failed for @{username}: {e}", exc_info=True)
-                            # 失敗してもプロセスは継続
+                            self.logger.error(f"Error processing tweet {tweet['id']}: {e}")
+                            failed_count += 1
+                    
+                    self.logger.info(f"Processed {saved_count} tweets successfully, {failed_count} failed for @{username}")
                     
             except Exception as e:
                 self.logger.error(f"Error in run_once: {e}", exc_info=True)
@@ -374,18 +389,57 @@ class EventMonitor:
         
         self.logger.info(f"Found {len(new_tweets)} new tweets for log-only account @{username}")
         
-        # log_only_tweetsテーブルに保存
-        saved_count = self.db_manager.save_log_only_tweets(new_tweets, username)
-        self.logger.info(f"Saved {saved_count} tweets to log_only_tweets table for @{username}")
+        # 一時的にツイートを保持（後でHFアップロード成功分のみDB保存）
+        # saved_count = self.db_manager.save_log_only_tweets(new_tweets, username)
+        # self.logger.info(f"Saved {saved_count} tweets to log_only_tweets table for @{username}")
         
-        # LogOnlyHFUploaderで画像処理（ダウンロード→HFアップロード→即削除）
-        if self.log_only_uploader.enabled:
+        # gallery-dlでメディアをダウンロード
+        if any(tweet.get('source') == 'gallery-dl' and (tweet.get('media') or tweet.get('videos')) for tweet in new_tweets):
+            tweet_ids_with_media = [
+                tweet['id'] for tweet in new_tweets 
+                if tweet.get('source') == 'gallery-dl' and (tweet.get('media') or tweet.get('videos'))
+            ]
+            
+            if tweet_ids_with_media:
+                # gallery-dlで images/ と videos/ にダウンロード
+                media_paths = self.twitter_monitor.gallery_dl_extractor.download_media_for_tweets(
+                    username, tweet_ids_with_media, move_to_images=True
+                )
+                
+                # ダウンロードしたメディアパスをツイートに追加
+                for tweet in new_tweets:
+                    if tweet['id'] in media_paths:
+                        tweet['local_media'] = media_paths[tweet['id']]
+                    else:
+                        tweet['local_media'] = []
+        else:
+            # メディアがない場合は空リスト
+            for tweet in new_tweets:
+                tweet['local_media'] = []
+        
+        # HuggingFaceバックアップ処理と同時にDB保存（1ツイートずつ）
+        saved_count = 0
+        failed_count = 0
+        
+        # リポジトリの存在確認
+        if self.backup_manager.backup_config.get('enabled', False):
+            self.backup_manager._ensure_repo_exists()
+        
+        for tweet in new_tweets:
             try:
-                await self.log_only_uploader.process_tweets(new_tweets, username)
-                self.logger.info(f"Log-only upload completed for @{username}")
+                # HFアップロード＆DB保存（成功時のみ）
+                success = await self.backup_manager.backup_tweet_and_save(tweet, username, is_log_only=True)
+                if success:
+                    saved_count += 1
+                    self.logger.debug(f"Successfully processed log-only tweet {tweet['id']}")
+                else:
+                    failed_count += 1
+                    self.logger.warning(f"Failed to process log-only tweet {tweet['id']}")
             except Exception as e:
-                self.logger.error(f"Log-only upload failed for @{username}: {e}")
-                # 失敗してもプロセスは継続
+                self.logger.error(f"Error processing log-only tweet {tweet['id']}: {e}")
+                failed_count += 1
+        
+        self.logger.info(f"Processed {saved_count} log-only tweets successfully, {failed_count} failed for @{username}")
         
         # 注意: 以下の処理は全てスキップ
         # - イベント検知（LLM処理）
