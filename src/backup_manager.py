@@ -848,6 +848,7 @@ class BackupManager:
     
     async def _upload_encrypted_file_internal(self, file_path: Path, file_type: str) -> Optional[str]:
         """ファイルを暗号化してアップロード（内部メソッド）"""
+        encrypted_files = None
         try:
             # ファイルタイプに基づいてディレクトリを決定
             if file_type == 'image':
@@ -895,12 +896,13 @@ class BackupManager:
             self.logger.error(f"Failed to upload encrypted {file_path}: {e}")
             self.logger.error(f"Error details - File: {file_path}, Repo: {self.full_repo_name}")
             # クリーンアップを試みる
-            if 'encrypted_files' in locals() and encrypted_files:
+            if encrypted_files:
                 try:
                     self.rclone_client.cleanup_temp_files(encrypted_files)
                 except:
                     pass
-            return None
+            # エラーを再発生させて上位でハンドリング
+            raise
     
     async def _upload_plain_file_internal(self, file_path: Path, file_type: str) -> Optional[str]:
         """ファイルを暗号化せずにアップロード（内部メソッド）"""
@@ -938,7 +940,8 @@ class BackupManager:
         except Exception as e:
             self.logger.error(f"Failed to upload {file_path}: {e}")
             self.logger.error(f"Error details - File: {file_path}, HF Path: {hf_path}, Repo: {self.full_repo_name}")
-            return None
+            # エラーを再発生させて上位でハンドリング
+            raise
     
     async def _is_already_uploaded(self, tweet_id: str) -> bool:
         """データベースから該当ツイートが既にアップロード済みかチェック（互換性のため残す）"""
