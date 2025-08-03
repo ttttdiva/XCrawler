@@ -162,9 +162,15 @@ class TwitterMonitor:
         """gallery-dlが全メディアを処理するため、この関数は不要"""
         return []
     
-    async def get_user_tweets_with_gallery_dl_first(self, username: str, days_lookback: int = 365, force_full_fetch: bool = False) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    async def get_user_tweets_with_gallery_dl_first(self, username: str, days_lookback: int = 365, force_full_fetch: bool = False, event_detection_enabled: bool = True) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         gallery-dl優先でツイートを取得
+        
+        Args:
+            username: Twitter username
+            days_lookback: 過去何日分を取得するか
+            force_full_fetch: 強制的に全件取得するか
+            event_detection_enabled: このアカウントでイベント検知を行うか
         
         Returns:
             (全ツイート, イベント関連ツイート)のタプル
@@ -187,7 +193,7 @@ class TwitterMonitor:
         if gallery_dl_enabled:
             self.logger.info(f"Step 1: Fetching media tweets with gallery-dl for @{username}")
             try:
-                gallery_tweets, gallery_event_tweets = await self.gallery_dl_extractor.fetch_and_analyze_tweets(username)
+                gallery_tweets, gallery_event_tweets = await self.gallery_dl_extractor.fetch_and_analyze_tweets(username, event_detection_enabled=event_detection_enabled)
                 
                 if gallery_tweets:
                     all_tweets.extend(gallery_tweets)

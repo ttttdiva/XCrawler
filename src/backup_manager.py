@@ -26,11 +26,9 @@ class BackupManager:
         self.backup_config = config.get('huggingface_backup', {})
         self.db_manager = db_manager
         
-        # バックアップが有効かチェック
-        if not self.backup_config.get('enabled', False):
-            self.logger.info("Hugging Face backup is disabled")
-            return
-            
+        # logアカウント用の場合は設定に関わらず初期化を続行
+        # （通常のバックアップが無効でもlogアカウントは処理する）
+        
         # HfApiの初期化
         try:
             import os
@@ -298,13 +296,11 @@ class BackupManager:
         Returns:
             bool: 処理成功の場合True
         """
-        if not self.backup_config.get('enabled', False):
-            # バックアップ無効の場合はDBに保存だけして成功とする
+        # logアカウントは設定に関わらず常にアップロード
+        if not is_log_only and not self.backup_config.get('enabled', False):
+            # 通常アカウントでバックアップ無効の場合はDBに保存だけして成功とする
             if self.db_manager:
-                if is_log_only:
-                    return self.db_manager.save_single_log_only_tweet(tweet, username)
-                else:
-                    return self.db_manager.save_single_tweet(tweet, username)
+                return self.db_manager.save_single_tweet(tweet, username)
             return True
             
         try:
@@ -347,6 +343,17 @@ class BackupManager:
                 # DB保存成功後にHF URLsを更新
                 if hf_urls:
                     self._update_tweet_hf_urls_batch(tweet_id, hf_urls, is_log_only=is_log_only)
+            
+            # アップロード成功後、ログアカウントの場合のみローカルファイルを削除
+            if is_log_only and tweet.get('local_media'):
+                for media_path in tweet['local_media']:
+                    try:
+                        media_file = Path(media_path)
+                        if media_file.exists():
+                            media_file.unlink()
+                            self.logger.debug(f"Deleted local file (log account): {media_path}")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to delete local file {media_path}: {e}")
             
             return True
                 
@@ -841,66 +848,97 @@ class BackupManager:
     
     async def _upload_encrypted_file_internal(self, file_path: Path, file_type: str) -> Optional[str]:
         """ファイルを暗号化してアップロード（内部メソッド）"""
-        # ファイルタイプに基づいてディレクトリを決定
-        if file_type == 'image':
-            base_dir = Path("images")
-            hf_dir = "encrypted_images"
-        else:
-            base_dir = Path("videos") 
-            hf_dir = "encrypted_videos"
-        
-        # ユーザー名を取得
-        username = file_path.parent.name
-        
-        # 暗号化
-        encrypted_files = self.rclone_client.encrypt_files_batch([file_path], base_dir)
-        
-        if not encrypted_files:
+        try:
+            # ファイルタイプに基づいてディレクトリを決定
+            if file_type == 'image':
+                base_dir = Path("images")
+                hf_dir = "encrypted_images"
+            else:
+                base_dir = Path("videos") 
+                hf_dir = "encrypted_videos"
+            
+            # ユーザー名を取得
+            username = file_path.parent.name
+            
+            # 暗号化
+            encrypted_files = self.rclone_client.encrypt_files_batch([file_path], base_dir)
+            
+            if not encrypted_files:
+                self.logger.error(f"Failed to encrypt file: {file_path}")
+                return None
+            
+            # 暗号化されたファイルをアップロード
+            encrypted_file = list(encrypted_files.values())[0]
+            hf_path = f"{hf_dir}/{username}/{encrypted_file.name}"
+            
+            self.logger.info(f"Uploading encrypted {file_path} to HuggingFace as {hf_path}")
+            self.logger.debug(f"Repository: {self.full_repo_name}, Token available: {bool(self.api.token)}")
+            
+            upload_file(
+                path_or_fileobj=str(encrypted_file),
+                path_in_repo=hf_path,
+                repo_id=self.full_repo_name,
+                token=self.api.token,
+                repo_type="dataset"
+            )
+            
+            self.logger.info(f"Successfully uploaded encrypted {file_path.name} to {hf_path}")
+            
+            # 一時ファイルをクリーンアップ
+            self.rclone_client.cleanup_temp_files(encrypted_files)
+            
+            # HuggingFace URLを返す
+            hf_url = f"https://huggingface.co/datasets/{self.full_repo_name}/resolve/main/{hf_path}"
+            return hf_url
+            
+        except Exception as e:
+            self.logger.error(f"Failed to upload encrypted {file_path}: {e}")
+            self.logger.error(f"Error details - File: {file_path}, Repo: {self.full_repo_name}")
+            # クリーンアップを試みる
+            if 'encrypted_files' in locals() and encrypted_files:
+                try:
+                    self.rclone_client.cleanup_temp_files(encrypted_files)
+                except:
+                    pass
             return None
-        
-        # 暗号化されたファイルをアップロード
-        encrypted_file = list(encrypted_files.values())[0]
-        hf_path = f"{hf_dir}/{username}/{encrypted_file.name}"
-        
-        upload_file(
-            path_or_fileobj=str(encrypted_file),
-            path_in_repo=hf_path,
-            repo_id=self.full_repo_name,
-            token=self.api.token,
-            repo_type="dataset"
-        )
-        
-        # 一時ファイルをクリーンアップ
-        self.rclone_client.cleanup_temp_files(encrypted_files)
-        
-        # HuggingFace URLを返す
-        return f"https://huggingface.co/datasets/{self.full_repo_name}/resolve/main/{hf_path}"
     
     async def _upload_plain_file_internal(self, file_path: Path, file_type: str) -> Optional[str]:
         """ファイルを暗号化せずにアップロード（内部メソッド）"""
-        # ファイルタイプに基づいてディレクトリを決定
-        if file_type == 'image':
-            hf_dir = "images"
-        else:
-            hf_dir = "videos"
-        
-        # ユーザー名を取得
-        username = file_path.parent.name
-        
-        # HuggingFaceのパス
-        hf_path = f"{hf_dir}/{username}/{file_path.name}"
-        
-        # アップロード
-        upload_file(
-            path_or_fileobj=str(file_path),
-            path_in_repo=hf_path,
-            repo_id=self.full_repo_name,
-            token=self.api.token,
-            repo_type="dataset"
-        )
-        
-        # HuggingFace URLを返す
-        return f"https://huggingface.co/datasets/{self.full_repo_name}/resolve/main/{hf_path}"
+        try:
+            # ファイルタイプに基づいてディレクトリを決定
+            if file_type == 'image':
+                hf_dir = "images"
+            else:
+                hf_dir = "videos"
+            
+            # ユーザー名を取得
+            username = file_path.parent.name
+            
+            # HuggingFaceのパス
+            hf_path = f"{hf_dir}/{username}/{file_path.name}"
+            
+            self.logger.info(f"Uploading {file_path} to HuggingFace as {hf_path}")
+            self.logger.debug(f"Repository: {self.full_repo_name}, Token available: {bool(self.api.token)}")
+            
+            # アップロード
+            upload_file(
+                path_or_fileobj=str(file_path),
+                path_in_repo=hf_path,
+                repo_id=self.full_repo_name,
+                token=self.api.token,
+                repo_type="dataset"
+            )
+            
+            self.logger.info(f"Successfully uploaded {file_path.name} to {hf_path}")
+            
+            # HuggingFace URLを返す
+            hf_url = f"https://huggingface.co/datasets/{self.full_repo_name}/resolve/main/{hf_path}"
+            return hf_url
+            
+        except Exception as e:
+            self.logger.error(f"Failed to upload {file_path}: {e}")
+            self.logger.error(f"Error details - File: {file_path}, HF Path: {hf_path}, Repo: {self.full_repo_name}")
+            return None
     
     async def _is_already_uploaded(self, tweet_id: str) -> bool:
         """データベースから該当ツイートが既にアップロード済みかチェック（互換性のため残す）"""

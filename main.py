@@ -122,7 +122,8 @@ class EventMonitor:
                     tweets, gallery_event_tweets = await self.twitter_monitor.get_user_tweets_with_gallery_dl_first(
                         username,
                         days_lookback=self.config['tweet_settings']['days_lookback'],
-                        force_full_fetch=self.config['tweet_settings'].get('force_full_fetch', False)
+                        force_full_fetch=self.config['tweet_settings'].get('force_full_fetch', False),
+                        event_detection_enabled=account.get('event_detection_enabled', True)
                     )
                     
                     if not tweets:
@@ -136,8 +137,9 @@ class EventMonitor:
                     
                     # account_typeに基づいて処理を分岐
                     if account_type == 'log':
-                        # ログ専用アカウントの処理
+                        # ログ専用アカウントの処理（完全に独立して処理を完結）
                         await self._process_log_only_account(tweets, username, display_name)
+                        # ログアカウントの処理が完了したので次のアカウントへ
                         continue
                     
                     # 通常アカウントの処理（簡略化版）
@@ -377,7 +379,7 @@ class EventMonitor:
                 await asyncio.sleep(interval)
     
     async def _process_log_only_account(self, tweets: List[Dict[str, Any]], username: str, display_name: str):
-        """ログ専用アカウントの処理（シンプルで高速）"""
+        """ログ専用アカウントの処理（1アカウントごとに完結）"""
         self.logger.info(f"Processing log-only account: {display_name} (@{username})")
         
         # 新規ツイートをフィルタリング
@@ -389,57 +391,82 @@ class EventMonitor:
         
         self.logger.info(f"Found {len(new_tweets)} new tweets for log-only account @{username}")
         
-        # 一時的にツイートを保持（後でHFアップロード成功分のみDB保存）
-        # saved_count = self.db_manager.save_log_only_tweets(new_tweets, username)
-        # self.logger.info(f"Saved {saved_count} tweets to log_only_tweets table for @{username}")
+        # メディア付きツイートのIDを収集
+        tweet_ids_with_media = [
+            tweet['id'] for tweet in new_tweets 
+            if tweet.get('source') == 'gallery-dl' and (tweet.get('media') or tweet.get('videos'))
+        ]
         
-        # gallery-dlでメディアをダウンロード
-        if any(tweet.get('source') == 'gallery-dl' and (tweet.get('media') or tweet.get('videos')) for tweet in new_tweets):
-            tweet_ids_with_media = [
-                tweet['id'] for tweet in new_tweets 
-                if tweet.get('source') == 'gallery-dl' and (tweet.get('media') or tweet.get('videos'))
-            ]
-            
-            if tweet_ids_with_media:
-                # gallery-dlで images/ と videos/ にダウンロード
-                media_paths = self.twitter_monitor.gallery_dl_extractor.download_media_for_tweets(
-                    username, tweet_ids_with_media, move_to_images=True
-                )
-                
-                # ダウンロードしたメディアパスをツイートに追加
-                for tweet in new_tweets:
-                    if tweet['id'] in media_paths:
-                        tweet['local_media'] = media_paths[tweet['id']]
-                    else:
-                        tweet['local_media'] = []
-        else:
-            # メディアがない場合は空リスト
-            for tweet in new_tweets:
-                tweet['local_media'] = []
+        self.logger.info(f"Found {len(tweet_ids_with_media)} tweets with media for @{username}")
         
-        # HuggingFaceバックアップ処理と同時にDB保存（1ツイートずつ）
-        saved_count = 0
-        failed_count = 0
-        
-        # リポジトリの存在確認
+        # リポジトリの存在確認（一度だけ）
         if self.backup_manager.backup_config.get('enabled', False):
             self.backup_manager._ensure_repo_exists()
         
+        # メディアを一括ダウンロード（1回のgallery-dl呼び出し）
+        media_paths = {}
+        if tweet_ids_with_media:
+            self.logger.info(f"Downloading media for {len(tweet_ids_with_media)} tweets in batch...")
+            media_paths = self.twitter_monitor.gallery_dl_extractor.download_media_for_tweets(
+                username, tweet_ids_with_media, move_to_images=True
+            )
+            self.logger.info(f"Downloaded media for {len(media_paths)} tweets")
+        
+        # ダウンロードしたメディアパスをツイートに追加
+        for tweet in new_tweets:
+            if tweet['id'] in media_paths:
+                tweet['local_media'] = media_paths[tweet['id']]
+            else:
+                tweet['local_media'] = []
+        
+        # 処理統計
+        saved_count = 0
+        failed_count = 0
+        processed_media_count = sum(len(paths) for paths in media_paths.values())
+        
+        # HFアップロード＆DB保存（1ツイートずつ）
         for tweet in new_tweets:
             try:
                 # HFアップロード＆DB保存（成功時のみ）
                 success = await self.backup_manager.backup_tweet_and_save(tweet, username, is_log_only=True)
+                
                 if success:
                     saved_count += 1
                     self.logger.debug(f"Successfully processed log-only tweet {tweet['id']}")
+                    # 注: backup_tweet_and_saveメソッド内でローカルファイルは既に削除される
                 else:
                     failed_count += 1
                     self.logger.warning(f"Failed to process log-only tweet {tweet['id']}")
+                    # 失敗時もローカルファイルを削除
+                    if tweet.get('local_media'):
+                        for media_path in tweet['local_media']:
+                            try:
+                                media_file = Path(media_path)
+                                if media_file.exists():
+                                    media_file.unlink()
+                                    self.logger.debug(f"Deleted local file after failure: {media_path}")
+                            except Exception as e:
+                                self.logger.warning(f"Failed to delete local file {media_path}: {e}")
+                
             except Exception as e:
                 self.logger.error(f"Error processing log-only tweet {tweet['id']}: {e}")
                 failed_count += 1
+                # エラー時もローカルファイルを削除
+                if tweet.get('local_media'):
+                    for media_path in tweet['local_media']:
+                        try:
+                            media_file = Path(media_path)
+                            if media_file.exists():
+                                media_file.unlink()
+                                self.logger.debug(f"Deleted local file after error: {media_path}")
+                        except Exception as del_e:
+                            self.logger.warning(f"Failed to delete local file {media_path}: {del_e}")
         
-        self.logger.info(f"Processed {saved_count} log-only tweets successfully, {failed_count} failed for @{username}")
+        self.logger.info(
+            f"Completed processing for @{username}: "
+            f"{saved_count} tweets saved, {failed_count} failed, "
+            f"{processed_media_count} media files processed"
+        )
         
         # 注意: 以下の処理は全てスキップ
         # - イベント検知（LLM処理）

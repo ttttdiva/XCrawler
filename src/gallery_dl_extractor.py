@@ -256,7 +256,7 @@ class GalleryDLExtractor:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=3600  # 1時間のタイムアウト
+                timeout=7200  # 2時間のタイムアウト
             )
             
             if result.returncode == 0:
@@ -347,11 +347,12 @@ class GalleryDLExtractor:
             self.logger.info(f"Downloading media for {len(tweet_ids)} tweets in batch mode")
             
             # gallery-dlを一度だけ実行（すべてのURLを処理）
+            # レート制限を考慮して十分な時間を設定（2時間）
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=max(60, len(tweet_ids) * 10)  # 最低60秒、ツイート数×10秒
+                timeout=7200  # 2時間のタイムアウト
             )
             
             if result.returncode != 0:
@@ -603,13 +604,14 @@ class GalleryDLExtractor:
         
         return sorted_tweets
     
-    async def fetch_and_analyze_tweets(self, username: str, limit: Optional[int] = None) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    async def fetch_and_analyze_tweets(self, username: str, limit: Optional[int] = None, event_detection_enabled: bool = True) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         gallery-dlでツイートを取得してイベント判定も実行
         
         Args:
             username: Twitter username
             limit: 取得件数制限（Noneで全件）
+            event_detection_enabled: このアカウントでイベント検知を行うか
             
         Returns:
             (全ツイート, イベント関連ツイート)のタプル
@@ -623,11 +625,14 @@ class GalleryDLExtractor:
         
         # イベント判定が設定されていて有効な場合のみ実行
         event_tweets = []
-        if self.event_detector and self.event_detector.enabled:
+        if self.event_detector and self.event_detector.enabled and event_detection_enabled:
             self.logger.info(f"Running event detection on {len(tweets)} tweets from @{username}")
             event_tweets = await self.event_detector.detect_event_tweets(tweets)
             self.logger.info(f"Found {len(event_tweets)} event-related tweets for @{username}")
         else:
-            self.logger.info("Event detection not available or disabled")
+            if not event_detection_enabled:
+                self.logger.info(f"Event detection disabled for @{username}")
+            else:
+                self.logger.info("Event detection not available or globally disabled")
         
         return tweets, event_tweets
