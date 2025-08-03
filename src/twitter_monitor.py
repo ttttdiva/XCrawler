@@ -42,7 +42,7 @@ twscrape_api.parse_tweets = parse_tweets_unlimited
 
 
 class TwitterMonitor:
-    def __init__(self, config: dict, db_manager=None):
+    def __init__(self, config: dict, db_manager=None, event_detector=None):
         self.config = config
         self.logger = logging.getLogger("EventMonitor.TwitterMonitor")
         self.api = API()
@@ -50,6 +50,10 @@ class TwitterMonitor:
         self._session = None
         self.db_manager = db_manager
         
+        # gallery-dl extractorを初期化
+        from .gallery_dl_extractor import GalleryDLExtractor
+        self.gallery_dl_extractor = GalleryDLExtractor(config, event_detector)
+    
     async def _initialize_accounts(self):
         """Twitter認証アカウントを初期化"""
         if self._accounts_initialized:
@@ -68,10 +72,8 @@ class TwitterMonitor:
             
             if main_token and main_ct0 and main_token != "your_auth_token_here":
                 if "twitter_main" not in existing_usernames:
-                    cookies = {
-                        "auth_token": main_token,
-                        "ct0": main_ct0
-                    }
+                    # twscrapeが期待する形式でcookieを渡す
+                    cookies = f"auth_token={main_token}; ct0={main_ct0}"
                     await self.api.pool.add_account(
                         username="twitter_main",
                         password="dummy_password",
@@ -99,11 +101,8 @@ class TwitterMonitor:
                     
                 username = f"twitter_user_{account_index}"
                 if username not in existing_usernames:
-                    # Cookie辞書形式で統一
-                    cookies = {
-                        "auth_token": token,
-                        "ct0": ct0
-                    }
+                    # twscrapeが期待する形式でcookieを渡す
+                    cookies = f"auth_token={token}; ct0={ct0}"
                     
                     await self.api.pool.add_account(
                         username=username,
@@ -174,7 +173,7 @@ class TwitterMonitor:
         if not self._session or self._session.closed:
             self._session = aiohttp.ClientSession()
             
-        for idx, image_url in enumerate(tweet_data['media']):
+        for idx, image_url in enumerate(tweet_data['media'], 1):  # 1から始まる連番
                 try:
                     file_path = image_dir / f"{tweet_data['id']}_{idx}.jpg"
                     
@@ -251,6 +250,239 @@ class TwitterMonitor:
         
         return downloaded_paths
     
+    async def get_user_tweets_with_gallery_dl_first(self, username: str, days_lookback: int = 365, force_full_fetch: bool = False) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        gallery-dl優先でツイートを取得
+        
+        Returns:
+            (全ツイート, イベント関連ツイート)のタプル
+        """
+        all_tweets = []
+        all_event_tweets = []
+        
+        # Gallery-dlの有効性をチェック
+        gallery_dl_enabled = self.config.get('tweet_settings', {}).get('gallery_dl', {}).get('enabled', True)
+        twscrape_enabled = self.config.get('tweet_settings', {}).get('twscrape', {}).get('enabled', True)
+        
+        # DB から今回のクロール実行前の最新ツイート日時を記録（twscrape用）
+        pre_crawl_latest_date = None
+        pre_crawl_latest_id = None
+        if self.db_manager:
+            pre_crawl_latest_date = self.db_manager.get_latest_tweet_date(username)
+            pre_crawl_latest_id = self.db_manager.get_latest_tweet_id(username)
+        
+        # 1. Gallery-dlでメディア付きツイートを優先取得
+        if gallery_dl_enabled:
+            self.logger.info(f"Step 1: Fetching media tweets with gallery-dl for @{username}")
+            try:
+                gallery_tweets, gallery_event_tweets = await self.gallery_dl_extractor.fetch_and_analyze_tweets(username)
+                
+                if gallery_tweets:
+                    all_tweets.extend(gallery_tweets)
+                    self.logger.info(f"Gallery-dl retrieved {len(gallery_tweets)} media tweets for @{username}")
+                    
+                if gallery_event_tweets:
+                    all_event_tweets.extend(gallery_event_tweets)
+                    self.logger.info(f"Gallery-dl found {len(gallery_event_tweets)} event tweets for @{username}")
+                
+            except Exception as e:
+                self.logger.error(f"Gallery-dl failed for @{username}: {e}")
+        else:
+            self.logger.info("Gallery-dl is disabled, skipping media tweet fetching")
+        
+        # 2. twscrapeでテキストのみツイートを補完取得
+        if twscrape_enabled:
+            self.logger.info(f"Step 2: Fetching remaining tweets with twscrape for @{username}")
+            try:
+                # twscrapeは事前に記録した最新日時を基準に効率化
+                twscrape_tweets = await self._get_user_tweets_twscrape_only(
+                    username, 
+                    days_lookback, 
+                    force_full_fetch, 
+                    latest_date_override=pre_crawl_latest_date,
+                    latest_id_override=pre_crawl_latest_id
+                )
+                
+                if twscrape_tweets:
+                    # gallery-dlで取得済みのツイートIDを除外
+                    gallery_tweet_ids = {tweet['id'] for tweet in all_tweets}
+                    new_twscrape_tweets = [
+                        tweet for tweet in twscrape_tweets 
+                        if tweet['id'] not in gallery_tweet_ids
+                    ]
+                    
+                    all_tweets.extend(new_twscrape_tweets)
+                    self.logger.info(f"twscrape added {len(new_twscrape_tweets)} additional tweets for @{username} (filtered {len(twscrape_tweets) - len(new_twscrape_tweets)} duplicates)")
+                
+            except Exception as e:
+                self.logger.error(f"twscrape failed for @{username}: {e}")
+        else:
+            self.logger.info("twscrape is disabled, skipping text-only tweet fetching")
+        
+        # 日付でソート（新しい順）
+        all_tweets.sort(key=lambda x: x['date'], reverse=True)
+        all_event_tweets.sort(key=lambda x: x['date'], reverse=True)
+        
+        self.logger.info(f"Total tweets retrieved for @{username}: {len(all_tweets)} (including {len(all_event_tweets)} event tweets)")
+        
+        return all_tweets, all_event_tweets
+    
+    async def _get_user_tweets_twscrape_only(self, username: str, days_lookback: int = 365, force_full_fetch: bool = False, latest_date_override=None, latest_id_override=None) -> List[Dict[str, Any]]:
+        """
+        twscrapeのみでツイートを取得（gallery-dl優先処理用）
+        
+        Args:
+            latest_date_override: 効率化のため外部から指定された最新日時
+            latest_id_override: 効率化のため外部から指定された最新ID
+        """
+        # 既存のget_user_tweetsロジックを流用し、DB取得部分のみoverride値を使用
+        await self._initialize_accounts()
+        
+        tweets = []
+        since_date = datetime.now(timezone.utc) - timedelta(days=days_lookback)
+        
+        # データベース接続と既存データの確認
+        from .database import DatabaseManager
+        db_manager = DatabaseManager(self.config)
+        
+        # 既存のツイートIDセットを取得（重複チェック用）
+        existing_tweet_ids = set()
+        if db_manager:
+            existing_tweet_ids = db_manager.get_existing_tweet_ids(username)
+            self.logger.debug(f"Found {len(existing_tweet_ids)} existing tweets in database for @{username}")
+        
+        # override値があればそれを使用、なければDBから取得
+        latest_tweet_date = latest_date_override
+        latest_tweet_id = latest_id_override
+        
+        if latest_tweet_date is None and not force_full_fetch:
+            latest_tweet_date = db_manager.get_latest_tweet_date(username)
+            latest_tweet_id = db_manager.get_latest_tweet_id(username)
+        
+        if not force_full_fetch and latest_tweet_date:
+            # 最新ツイート日付以降のみ取得（効率化）
+            since_date = latest_tweet_date
+            self.logger.info(f"twscrape: Found existing tweets for @{username}, fetching since {since_date.strftime('%Y-%m-%d %H:%M:%S')}")
+            if latest_tweet_id:
+                self.logger.debug(f"twscrape: Latest tweet ID: {latest_tweet_id}")
+        elif not force_full_fetch:
+            self.logger.info(f"twscrape: No existing tweets for @{username}, fetching since {since_date.strftime('%Y-%m-%d')}")
+        else:
+            self.logger.info(f"twscrape: Force full fetch enabled for @{username}, fetching ALL tweets since {since_date.strftime('%Y-%m-%d')} with duplicate checking")
+        
+        try:
+            # First, resolve username to user ID
+            user = await self.api.user_by_login(username)
+            if not user:
+                self.logger.error(f"twscrape: User @{username} not found or suspended")
+                return []
+            
+            display_name = user.displayname
+            self.logger.info(f"twscrape: Resolved @{username} to user ID: {user.id} (Name: {display_name})")
+            
+            tweet_count = 0
+            total_fetched = 0
+            old_tweets_count = 0
+            consecutive_old_tweets = 0
+            max_consecutive_old = 20
+            
+            # kvパラメータで日付フィルタリング
+            kv = None
+            if latest_tweet_date and not force_full_fetch:
+                kv = {"since_time": latest_tweet_date.isoformat()}
+                self.logger.debug(f"twscrape: Using kv parameter: {kv}")
+            
+            async for tweet in self.api.user_tweets(user.id):
+                total_fetched += 1
+                self.logger.debug(f"twscrape: Tweet {total_fetched}: ID={tweet.id}, Date={tweet.date}")
+                
+                # Tweet IDベースの早期終了
+                if not force_full_fetch and latest_tweet_id and int(tweet.id) <= int(latest_tweet_id):
+                    self.logger.debug(f"twscrape: Reached known tweet {tweet.id}, stopping")
+                    break
+                
+                # 日付チェック
+                if tweet.date < since_date:
+                    old_tweets_count += 1
+                    consecutive_old_tweets += 1
+                    self.logger.debug(f"twscrape: Skipping old tweet: {tweet.id}")
+                    
+                    if not force_full_fetch and consecutive_old_tweets >= max_consecutive_old:
+                        self.logger.debug(f"twscrape: Reached {max_consecutive_old} consecutive old tweets, stopping")
+                        break
+                    continue
+                else:
+                    consecutive_old_tweets = 0
+                
+                # リツイートをスキップ
+                if self._is_retweet(tweet, username):
+                    self.logger.debug(f"twscrape: Skipping retweet: {tweet.id}")
+                    continue
+                
+                # 既存ツイートとの重複チェック
+                tweet_id_str = str(tweet.id)
+                if tweet_id_str in existing_tweet_ids:
+                    self.logger.debug(f"twscrape: Skipping duplicate tweet: {tweet.id}")
+                    continue
+                
+                # ツイートデータを抽出
+                tweet_data = {
+                    'id': str(tweet.id),
+                    'text': tweet.rawContent,
+                    'date': tweet.date.isoformat(),
+                    'url': f"https://twitter.com/{username}/status/{tweet.id}",
+                    'username': username,
+                    'media': [],
+                    'videos': []
+                }
+                
+                # メディア（画像）URLを抽出
+                if hasattr(tweet, 'media') and hasattr(tweet.media, 'photos'):
+                    tweet_data['media'] = [photo.url for photo in tweet.media.photos]
+                
+                # 動画URLを抽出
+                if hasattr(tweet, 'media') and hasattr(tweet.media, 'videos'):
+                    for video in tweet.media.videos:
+                        best_variant = None
+                        best_bitrate = 0
+                        
+                        if hasattr(video, 'variants'):
+                            for variant in video.variants:
+                                if hasattr(variant, 'bitrate') and variant.bitrate:
+                                    if variant.bitrate > best_bitrate:
+                                        best_bitrate = variant.bitrate
+                                        best_variant = variant
+                        
+                        if best_variant and hasattr(best_variant, 'url'):
+                            tweet_data['videos'].append(best_variant.url)
+                        elif hasattr(video, 'url'):
+                            tweet_data['videos'].append(video.url)
+                
+                tweets.append(tweet_data)
+                tweet_count += 1
+                
+                if tweet_count % 100 == 0:
+                    self.logger.debug(f"twscrape: Fetched {tweet_count} tweets so far...")
+            
+            # 重複を除去
+            unique_tweets = []
+            seen_ids = set()
+            for tweet in tweets:
+                if tweet['id'] not in seen_ids:
+                    unique_tweets.append(tweet)
+                    seen_ids.add(tweet['id'])
+            
+            duplicate_count = len(tweets) - len(unique_tweets)
+            if duplicate_count > 0:
+                self.logger.warning(f"twscrape: Removed {duplicate_count} duplicate tweets")
+            
+            self.logger.info(f"twscrape: Fetched {len(unique_tweets)} unique tweets for @{username} (examined: {total_fetched}, old skipped: {old_tweets_count})")
+            return unique_tweets
+            
+        except Exception as e:
+            self.logger.error(f"twscrape: Error fetching tweets for @{username}: {e}")
+            return []
+    
     async def get_user_tweets(self, username: str, days_lookback: int = 365, force_full_fetch: bool = False) -> List[Dict[str, Any]]:
         """指定ユーザーのツイートを取得（リツイート除く）"""
         await self._initialize_accounts()
@@ -297,124 +529,6 @@ class TwitterMonitor:
             display_name = user.displayname  # display_nameを設定
             self.logger.info(f"Resolved @{username} to user ID: {user.id} (Name: {display_name})")
             self.logger.info(f"@{username} の総ツイート数: {user.statusesCount}")
-            
-            # Playwrightを使うべきか判定
-            total_tweets = user.statusesCount
-            playwright_threshold = self.config['tweet_settings'].get('playwright_threshold', 700)
-            playwright_enabled = self.config['tweet_settings'].get('playwright', {}).get('enabled', True)
-            
-            # Playwrightを使用する場合の判定
-            if playwright_enabled and force_full_fetch and total_tweets > playwright_threshold:
-                self.logger.info(f"@{username}: 総ツイート数 {total_tweets} > 制限 {playwright_threshold}")
-                self.logger.info("Playwrightモードで全ツイートを取得します")
-                coverage = (playwright_threshold / total_tweets) * 100
-                self.logger.info(f"twscrapeだけでは約 {coverage:.1f}% しか取得できません")
-                try:
-                    from .browser_fetcher import BrowserFetcher
-                    
-                    self.logger.info(f"Playwrightでツイート収集を開始: @{username}")
-                    
-                    fetcher = BrowserFetcher(self.config, self.db_manager, self)
-                    tweet_ids = await fetcher.fetch_all_tweet_ids(username)
-                    
-                    self.logger.info(f"\n=== Playwright ID収集結果 ===")
-                    self.logger.info(f"収集したツイートID数: {len(tweet_ids)}件")
-                    self.logger.info(f"推定カバー率: {len(tweet_ids)/total_tweets*100:.1f}%")
-                    self.logger.info(f"================================\n")
-                    
-                    # 収集したIDからtwscrapeでツイート詳細を取得
-                    self.logger.info(f"twscrapeで詳細データを取得開始...")
-                    detailed_tweets = []
-                    failed_ids = []
-                    
-                    # バッチ処理でツイートデータを取得（並行処理に最適化）
-                    batch_size = 10  # 並行処理のため小さめのバッチサイズに変更
-                    for i in range(0, len(tweet_ids), batch_size):
-                        batch_ids = tweet_ids[i:i+batch_size]
-                        self.logger.info(f"バッチ {i//batch_size + 1}/{(len(tweet_ids) + batch_size - 1)//batch_size}: {len(batch_ids)}件のツイートを取得中...")
-                        
-                        # 並行処理用のタスクリストを作成
-                        async def fetch_tweet_detail(tweet_id):
-                            try:
-                                tweet = await self.api.tweet_details(int(tweet_id))
-                                if tweet:
-                                    # リツイート判定
-                                    if self._is_retweet(tweet, username):
-                                        self.logger.debug(f"Skipping retweet: {tweet_id}")
-                                        return None
-                                    
-                                    # ツイートデータを構築
-                                    tweet_data = {
-                                        'id': str(tweet.id),
-                                        'text': tweet.rawContent,
-                                        'date': tweet.date.isoformat(),
-                                        'url': f"https://twitter.com/{username}/status/{tweet.id}",
-                                        'username': username,
-                                        'display_name': display_name,
-                                        'media': [],
-                                        'videos': []
-                                    }
-                                    
-                                    # メディア（画像）URLを抽出
-                                    if hasattr(tweet, 'media') and hasattr(tweet.media, 'photos'):
-                                        tweet_data['media'] = [photo.url for photo in tweet.media.photos]
-                                    
-                                    # 動画URLを抽出
-                                    if hasattr(tweet, 'media') and hasattr(tweet.media, 'videos'):
-                                        for video in tweet.media.videos:
-                                            # 最高画質のバリアントを選択
-                                            best_variant = None
-                                            best_bitrate = 0
-                                            
-                                            if hasattr(video, 'variants'):
-                                                for variant in video.variants:
-                                                    if hasattr(variant, 'bitrate') and variant.bitrate:
-                                                        if variant.bitrate > best_bitrate:
-                                                            best_bitrate = variant.bitrate
-                                                            best_variant = variant
-                                            
-                                            if best_variant and hasattr(best_variant, 'url'):
-                                                tweet_data['videos'].append(best_variant.url)
-                                            elif hasattr(video, 'url'):
-                                                tweet_data['videos'].append(video.url)
-                                    
-                                    return tweet_data
-                                return None
-                            except Exception as e:
-                                self.logger.error(f"Failed to fetch tweet {tweet_id}: {e}")
-                                return {'error': str(e), 'tweet_id': tweet_id}
-                        
-                        # すべてのタスクを並行実行
-                        tasks = [fetch_tweet_detail(tweet_id) for tweet_id in batch_ids]
-                        results = await asyncio.gather(*tasks)
-                        
-                        # 結果を処理
-                        for result in results:
-                            if result is None:
-                                continue
-                            elif isinstance(result, dict) and 'error' in result:
-                                failed_ids.append(result['tweet_id'])
-                            else:
-                                detailed_tweets.append(result)
-                        
-                        # レート制限対策の待機（並行処理のため短縮）
-                        if i + batch_size < len(tweet_ids):
-                            await asyncio.sleep(0.3)
-                    
-                    self.logger.info(f"\n=== twscrape詳細取得結果 ===")
-                    self.logger.info(f"成功: {len(detailed_tweets)}件")
-                    self.logger.info(f"失敗: {len(failed_ids)}件") 
-                    self.logger.info(f"最終取得率: {len(detailed_tweets)/total_tweets*100:.1f}%")
-                    self.logger.info(f"================================\n")
-                    
-                    return detailed_tweets
-                    
-                except ImportError:
-                    self.logger.error("Playwrightの読み込みに失敗しました")
-                    self.logger.warning("twscrapeでの取得にフォールバックします")
-                except Exception as e:
-                    self.logger.error(f"Playwright実行中にエラーが発生: {e}")
-                    self.logger.warning("twscrapeでの取得にフォールバックします")
             
             tweet_count = 0
             total_fetched = 0
@@ -557,6 +671,64 @@ class TwitterMonitor:
                 self.logger.warning(f"Removed {duplicate_count} duplicate tweets from current fetch")
             
             self.logger.info(f"Fetched {len(unique_tweets)} unique tweets for @{username} (total examined: {total_fetched}, old tweets skipped: {old_tweets_count}, duplicates removed: {duplicate_count})")
+            
+            # gallery-dl統合（設定で有効な場合）
+            gallery_dl_config = self.config.get('tweet_settings', {}).get('gallery_dl', {})
+            if gallery_dl_config.get('enabled', False):
+                self.logger.info(f"gallery-dl integration enabled for @{username}")
+                try:
+                    from .gallery_dl_extractor import GalleryDLExtractor
+                    gallery_extractor = GalleryDLExtractor(self.config)
+                    
+                    # gallery-dlでメディア付きツイートを取得（制限なし）
+                    self.logger.info(f"Fetching all media tweets with gallery-dl")
+                    gallery_tweets = gallery_extractor.fetch_media_tweets(username, limit=None)
+                    
+                    if gallery_tweets:
+                        # 既存のツイートIDセット（重複排除用）
+                        existing_ids = {tweet['id'] for tweet in unique_tweets}
+                        existing_ids.update(existing_tweet_ids)  # データベースの既存IDも含める
+                        
+                        # gallery-dlのツイートを追加（重複を除く）
+                        new_from_gallery = []
+                        new_tweet_ids = []  # 新規ツイートIDのリスト（ダウンロード用）
+                        for g_tweet in gallery_tweets:
+                            if g_tweet['id'] not in existing_ids:
+                                # display_nameを追加
+                                g_tweet['display_name'] = display_name
+                                new_from_gallery.append(g_tweet)
+                                new_tweet_ids.append(g_tweet['id'])  # 新規ツイートIDを記録
+                                existing_ids.add(g_tweet['id'])
+                        
+                        if new_from_gallery:
+                            self.logger.info(f"Added {len(new_from_gallery)} new tweets from gallery-dl")
+                            
+                            # 新規ツイートのメディアのみをダウンロード
+                            if new_tweet_ids:
+                                self.logger.info(f"Downloading media files for {len(new_tweet_ids)} new tweets")
+                                tweet_media_paths = gallery_extractor.download_media_for_tweets(username, new_tweet_ids)
+                                
+                                # 各ツイートにlocal_mediaを設定
+                                for g_tweet in new_from_gallery:
+                                    if g_tweet['id'] in tweet_media_paths:
+                                        g_tweet['local_media'] = tweet_media_paths[g_tweet['id']]
+                                        self.logger.debug(f"Set local_media for tweet {g_tweet['id']}: {len(g_tweet['local_media'])} files")
+                                    else:
+                                        g_tweet['local_media'] = []
+                            
+                            unique_tweets.extend(new_from_gallery)
+                            
+                            # 日付でソート（新しい順）
+                            unique_tweets.sort(key=lambda x: x['date'], reverse=True)
+                        else:
+                            self.logger.info(f"No new tweets from gallery-dl (all {len(gallery_tweets)} were duplicates)")
+                    else:
+                        self.logger.info("No media tweets found by gallery-dl")
+                        
+                except Exception as e:
+                    self.logger.error(f"gallery-dl integration failed: {e}")
+                    # エラーが発生してもtwscrapeの結果は返す
+            
             return unique_tweets
             
         except Exception as e:

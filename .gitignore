@@ -37,6 +37,7 @@ env/
 # Environment variables
 .env
 .env.local
+cookies/
 
 # Database
 data/

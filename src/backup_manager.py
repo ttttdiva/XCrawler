@@ -78,7 +78,7 @@ class BackupManager:
     
     def _extract_base_repo_name(self, repo_name: str) -> str:
         """リポジトリ名から番号を除いたベース名を抽出"""
-        # 例: "hf_tarou/XCrawler_1" → "hf_tarou/XCrawler"
+        # 例: "hfusername/XCrawler_1" → "hfusername/XCrawler"
         match = re.match(r'^(.+?)(_\d+)?$', repo_name)
         if match:
             return match.group(1)

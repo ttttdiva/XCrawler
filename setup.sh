@@ -76,20 +76,6 @@ if grep -qi microsoft /proc/version 2>/dev/null; then
     echo -e "${GREEN}✓ WSL用SQLite互換ライブラリをインストールしました${NC}"
 fi
 
-# Playwrightブラウザのインストール
-echo -e "\n${YELLOW}Playwrightブラウザをインストール中...${NC}"
-playwright install chromium
-echo -e "${GREEN}✓ Chromiumブラウザをインストールしました${NC}"
-
-# 必要なディレクトリ作成
-echo -e "\n${YELLOW}必要なディレクトリを作成中...${NC}"
-mkdir -p data images logs videos
-echo -e "${GREEN}✓ ディレクトリを作成しました${NC}"
-echo -e "  • data/   - データベースとログ保存用"
-echo -e "  • images/ - ダウンロードした画像保存用"
-echo -e "  • videos/ - ダウンロードした動画保存用"
-echo -e "  • logs/   - アプリケーションログ保存用"
-
 # 設定ファイルの確認
 echo -e "\n${YELLOW}設定ファイルを確認中...${NC}"
 

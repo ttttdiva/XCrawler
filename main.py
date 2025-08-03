@@ -35,8 +35,8 @@ class EventMonitor:
         
         # コンポーネントの初期化
         self.db_manager = DatabaseManager(self.config)
-        self.twitter_monitor = TwitterMonitor(self.config, self.db_manager)
         self.event_detector = EventDetector(self.config)
+        self.twitter_monitor = TwitterMonitor(self.config, self.db_manager, self.event_detector)
         self.discord_notifier = DiscordNotifier(self.config)
         self.backup_manager = BackupManager(self.config, self.db_manager)
         self.hydrus_client = HydrusClient(self.config.get('hydrus', {}))
@@ -88,9 +88,9 @@ class EventMonitor:
         data_dir = Path("data")
         data_dir.mkdir(exist_ok=True)
         
-        # ロガーを初期化（dataディレクトリにログを保存）
+        # ロガーを初期化（logsディレクトリにログを保存）
         if self.logger is None:
-            self.logger = setup_logging(self.config['system']['log_level'], data_dir)
+            self.logger = setup_logging(self.config['system']['log_level'])
         
         self.logger.info("EventMonitor started (single run)")
         
@@ -117,8 +117,8 @@ class EventMonitor:
                     type_display = "ログ専用" if account_type == 'log' else "監視"
                     self.logger.info(f"Checking account: {display_name} (@{username}) - Type: {type_display}")
                     
-                    # ツイートを取得
-                    tweets = await self.twitter_monitor.get_user_tweets(
+                    # ツイートを取得（gallery-dl優先）
+                    tweets, gallery_event_tweets = await self.twitter_monitor.get_user_tweets_with_gallery_dl_first(
                         username,
                         days_lookback=self.config['tweet_settings']['days_lookback'],
                         force_full_fetch=self.config['tweet_settings'].get('force_full_fetch', False)
@@ -205,8 +205,29 @@ class EventMonitor:
                     )
                     
                     if event_detection_enabled:
-                        # 新規ツイートのみLLMで判定
-                        event_tweets = await self.event_detector.detect_event_tweets(new_tweets)
+                        # gallery-dlで既に判定済みのイベントツイートがあるかチェック
+                        event_tweets = []
+                        
+                        if gallery_event_tweets:
+                            # gallery-dlで判定済みのイベントツイートを追加
+                            gallery_event_in_new = [
+                                tweet for tweet in gallery_event_tweets
+                                if tweet['id'] in {t['id'] for t in new_tweets}
+                            ]
+                            event_tweets.extend(gallery_event_in_new)
+                            self.logger.info(f"Added {len(gallery_event_in_new)} gallery-dl event tweets for @{username}")
+                        
+                        # gallery-dlで判定されていない新規ツイートをLLMで判定
+                        gallery_processed_ids = {tweet['id'] for tweet in gallery_event_tweets} if gallery_event_tweets else set()
+                        remaining_tweets = [
+                            tweet for tweet in new_tweets
+                            if tweet['id'] not in gallery_processed_ids
+                        ]
+                        
+                        if remaining_tweets:
+                            self.logger.info(f"Running LLM event detection on {len(remaining_tweets)} remaining tweets for @{username}")
+                            additional_event_tweets = await self.event_detector.detect_event_tweets(remaining_tweets)
+                            event_tweets.extend(additional_event_tweets)
                         
                         if not event_tweets:
                             self.logger.info(f"No event-related tweets found for @{username}")
@@ -310,7 +331,7 @@ class EventMonitor:
         
         # 初回実行時のロガー初期化
         if self.logger is None:
-            self.logger = setup_logging(self.config['system']['log_level'], data_dir)
+            self.logger = setup_logging(self.config['system']['log_level'])
         
         self.logger.info("EventMonitor started (continuous mode)")
         
@@ -331,7 +352,7 @@ class EventMonitor:
     
     async def _process_log_only_account(self, tweets: List[Dict[str, Any]], username: str, display_name: str):
         """ログ専用アカウントの処理（シンプルで高速）"""
-        self.logger.info(f"Processing log-only account: @{username}")
+        self.logger.info(f"Processing log-only account: {display_name} (@{username})")
         
         # 新規ツイートをフィルタリング
         new_tweets = self.db_manager.filter_log_only_tweets(tweets, username)

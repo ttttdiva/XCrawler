@@ -12,7 +12,7 @@ def setup_logging(log_level: str = "INFO", log_dir: Path = None) -> logging.Logg
     
     # ログディレクトリが指定されていない場合はデフォルト
     if log_dir is None:
-        log_dir = Path("data")
+        log_dir = Path("logs")
         log_dir.mkdir(exist_ok=True)
     
     # ログファイルは常にapp.log

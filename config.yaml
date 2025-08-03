@@ -32,21 +32,15 @@ tweet_settings:
   # 強制的に全ツイートを取得するか（効率化を無視）
   force_full_fetch: false
   
-  # Playwright閾値（ツイート件数がこの件数を超える場合にPlaywrightを使用）
-  playwright_threshold: 700
+  # gallery-dl設定（メディア付きツイートの取得と画像・動画ダウンロード）
+  gallery_dl:
+    # gallery-dlを使用するか（優先実行される）
+    enabled: true
   
-  # Playwright設定
-  playwright:
-    # Playwrightを使用するか（false: twscrapeのみで最大限取得）
-    enabled: false
-    # ヘッドレスモード（true: バックグラウンド実行、false: ブラウザ表示）
-    headless: true
-    # 全件取得モード（制限なし）
-    unlimited_mode: true
-    # 安全装置（最大取得件数 - 10万件で停止）
-    safety_limit: 100000
-    # 連続で新しいツイートが見つからない場合の停止回数
-    max_consecutive_no_new: 30
+  # twscrape設定（テキストのみツイート取得）
+  twscrape:
+    # twscrapeを使用するか（gallery-dlで取得できなかったツイートを補完）
+    enabled: true
 
 # イベント判定設定
 event_detection:
@@ -92,7 +86,7 @@ huggingface_backup:
   # バックアップを有効にするか
   enabled: false
   # リポジトリ名（HUGGINGFACE_REPO_NAME環境変数で上書き可能）
-  repo_name: "hf_tarou/XCrawler_1"
+  repo_name: "hfusername/XCrawler_1"
   # 画像も含めるか
   include_images: true
   # rclone暗号化設定

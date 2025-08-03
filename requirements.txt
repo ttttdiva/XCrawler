@@ -1,7 +1,9 @@
 # Twitter scraping
 twscrape==0.16.0
 pysqlite3-binary  # For modern SQLite features
-playwright>=1.40.0  # For browser automation
+
+# Media download
+gallery-dl>=1.26.0
 
 # Database
 PyMySQL==1.1.0

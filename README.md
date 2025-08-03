@@ -84,35 +84,56 @@ daemon:
 
 # ツイート取得設定
 tweet_settings:
-  days_lookback: 36500  # 過去何日分を取得（twscrapeのみの場合およそ300件～500件程度が取得上限。全件取得する場合はplaywright有効化が必要）
-
-# Playwright有効化（全件取得可能だが動作不安定）
-playwright:
-  enabled: false  # true にすると恐らく全件取得できるが処理が遅く、実装途中の為動作不安定
+  days_lookback: 36500  # 過去何日分を取得
+  
+  # gallery-dl統合（メディア付きツイート全件取得）
+  gallery_dl:
+    enabled: true  # twscrapeの制限（700-1000件）を超えて全メディア取得
 
 # イベント検出
 event_detection:
   enabled: true  # false でクローラーモードに
 ```
 
-### Twitter Cookie取得方法
+### Twitter Cookie設定方法（必須）
 
+#### 1. Cookie値の取得
 1. **ブラウザでTwitter/Xにログイン**
 2. **F12キーで開発者ツールを開く**
 3. **上部タブから「Application」または「アプリケーション」を選択**
 4. **左側メニューから「Cookies」→「https://x.com」を展開**
 5. **以下の値をコピー**：
-   - `auth_token` → `.env`の`TWITTER_ACCOUNT_1_TOKEN`に設定
-   - `ct0` → `.env`の`TWITTER_ACCOUNT_1_CT0`に設定
+   - `auth_token`の値
+   - `ct0`の値
 
-※複数アカウントを使う場合は、ログアウトしないまま別アカウントでログイン→Cookie取得を繰り返す
-※1ブラウザにつき5アカウントまでしかログインできない為、5個以上Cookieを取得する場合はブラウザユーザーを分けるか別ブラウザでログインする
+#### 2. .envファイルに設定
+```env
+TWITTER_ACCOUNT_1_TOKEN=取得したauth_tokenの値
+TWITTER_ACCOUNT_1_CT0=取得したct0の値
+```
+
+#### 3. Cookieファイルの作成
+**GET Cookie.txt LOCALLY**拡張機能を使用して、
+x.comのCookieをNetscape形式で`cookies/x.com_cookies.txt`にエクスポートしてください。
+
+**参考**: 正しいファイル形式（Netscape Cookie形式）
+```
+# Netscape HTTP Cookie File
+
+.x.com	TRUE	/	TRUE	1786716311	auth_token	実際の値
+.x.com	TRUE	/	TRUE	1786716311	ct0	実際の値
+```
+
+#### 複数アカウント対応
+複数アカウントを使用する場合：
+- `.env`に`TWITTER_ACCOUNT_2_TOKEN`, `TWITTER_ACCOUNT_2_CT0`等を追加
+- `cookies/x.com_cookies_2.txt`, `cookies/x.com_cookies_3.txt`等のファイルを作成
 
 ## トラブルシューティング
 
 - **認証エラー**: Cookie（auth_token, ct0）の有効期限を確認
 - **レート制限**: 複数アカウントを追加（推奨3アカウント以上）
-- **Playwright**: `playwright install chromium`を実行
+- **Hugging Faceバックアップ**: rclone.confのパスワードをデフォルトから変更してください（セキュリティ上の理由）
 
 ## ライセンス
 

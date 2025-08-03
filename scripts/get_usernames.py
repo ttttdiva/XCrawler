@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-get_username_list.txtのユーザーIDに対応するハンドルネームを取得するスクリプト
+list_hiero2.txtのユーザーIDに対応するハンドルネームを取得するスクリプト
 twscrapeを使用してTwitterユーザー情報を取得
 """
 
@@ -109,7 +109,7 @@ class UsernameExtractor:
             raise
     
     def _parse_user_ids(self, file_path: str) -> List[str]:
-        """get_username_list.txtからユーザーIDを抽出"""
+        """list_hiero2.txtからユーザーIDを抽出"""
         user_ids = []
         
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -204,7 +204,7 @@ class UsernameExtractor:
 
 async def main():
     """メイン関数"""
-    input_file = "get_username_list.txt"
+    input_file = "list_hiero2.txt"
     output_file = "hiero2_usernames.csv"
     
     if not os.path.exists(input_file):
