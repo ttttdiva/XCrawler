@@ -72,7 +72,6 @@ class TwitterMonitor:
             
             if main_token and main_ct0 and main_token != "your_auth_token_here":
                 if "twitter_main" not in existing_usernames:
-                    # twscrapeが期待する形式でcookieを渡す
                     cookies = f"auth_token={main_token}; ct0={main_ct0}"
                     await self.api.pool.add_account(
                         username="twitter_main",
@@ -101,7 +100,7 @@ class TwitterMonitor:
                     
                 username = f"twitter_user_{account_index}"
                 if username not in existing_usernames:
-                    # twscrapeが期待する形式でcookieを渡す
+                    # Cookie辞書形式で統一
                     cookies = f"auth_token={token}; ct0={ct0}"
                     
                     await self.api.pool.add_account(
@@ -156,99 +155,12 @@ class TwitterMonitor:
         return False
     
     async def download_tweet_images(self, tweet_data: Dict[str, Any]) -> List[str]:
-        """ツイートの画像をダウンロード"""
-        if not tweet_data.get('media') or not tweet_data['media']:
-            return []
-        
-        # display_nameを使用、なければusernameをフォールバック
-        display_name = tweet_data.get('display_name') or tweet_data.get('username', 'unknown')
-        # ファイルシステムで使えない文字を置換
-        safe_display_name = self._sanitize_filename(display_name)
-        image_dir = Path('images') / safe_display_name
-        image_dir.mkdir(parents=True, exist_ok=True)
-        
-        downloaded_paths = []
-        
-        # セッションの再利用
-        if not self._session or self._session.closed:
-            self._session = aiohttp.ClientSession()
-            
-        for idx, image_url in enumerate(tweet_data['media'], 1):  # 1から始まる連番
-                try:
-                    file_path = image_dir / f"{tweet_data['id']}_{idx}.jpg"
-                    
-                    # 既にダウンロード済みの場合はスキップ
-                    if file_path.exists():
-                        self.logger.debug(f"Image already exists: {file_path}")
-                        downloaded_paths.append(str(file_path))
-                        continue
-                    
-                    # 画像をダウンロード
-                    async with self._session.get(image_url) as response:
-                        if response.status == 200:
-                            content = await response.read()
-                            with open(file_path, 'wb') as f:
-                                f.write(content)
-                            self.logger.debug(f"Downloaded image: {file_path}")
-                            downloaded_paths.append(str(file_path))
-                        else:
-                            self.logger.warning(f"Failed to download image: {image_url} (status: {response.status})")
-                            
-                except Exception as e:
-                    self.logger.error(f"Error downloading image {image_url}: {e}")
-        
-        return downloaded_paths
+        """gallery-dlが全メディアを処理するため、この関数は不要"""
+        return []
     
     async def download_tweet_videos(self, tweet_data: Dict[str, Any]) -> List[str]:
-        """ツイートの動画をダウンロード"""
-        if not tweet_data.get('videos') or not tweet_data['videos']:
-            return []
-        
-        # display_nameを使用、なければusernameをフォールバック
-        display_name = tweet_data.get('display_name') or tweet_data.get('username', 'unknown')
-        # ファイルシステムで使えない文字を置換
-        safe_display_name = self._sanitize_filename(display_name)
-        video_dir = Path('videos') / safe_display_name
-        video_dir.mkdir(parents=True, exist_ok=True)
-        
-        downloaded_paths = []
-        
-        # セッションの再利用
-        if not self._session or self._session.closed:
-            self._session = aiohttp.ClientSession()
-            
-        for idx, video_url in enumerate(tweet_data['videos']):
-            try:
-                # 動画ファイルの拡張子を決定
-                extension = '.mp4'  # デフォルト
-                if '.m3u8' in video_url:
-                    extension = '.m3u8'
-                elif '.gif' in video_url:
-                    extension = '.gif'
-                
-                file_path = video_dir / f"{tweet_data['id']}_{idx}{extension}"
-                
-                # 既にダウンロード済みの場合はスキップ
-                if file_path.exists():
-                    self.logger.debug(f"Video already exists: {file_path}")
-                    downloaded_paths.append(str(file_path))
-                    continue
-                
-                # 動画をダウンロード
-                async with self._session.get(video_url) as response:
-                    if response.status == 200:
-                        content = await response.read()
-                        with open(file_path, 'wb') as f:
-                            f.write(content)
-                        self.logger.debug(f"Downloaded video: {file_path}")
-                        downloaded_paths.append(str(file_path))
-                    else:
-                        self.logger.warning(f"Failed to download video: {video_url} (status: {response.status})")
-                        
-            except Exception as e:
-                self.logger.error(f"Error downloading video {video_url}: {e}")
-        
-        return downloaded_paths
+        """gallery-dlが全メディアを処理するため、この関数は不要"""
+        return []
     
     async def get_user_tweets_with_gallery_dl_first(self, username: str, days_lookback: int = 365, force_full_fetch: bool = False) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """

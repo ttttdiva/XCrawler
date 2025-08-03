@@ -155,23 +155,34 @@ class EventMonitor:
                     
                     self.logger.info(f"Found {len(new_tweets)} new tweets for @{username}")
                     
-                    # 2. メディアのダウンロード
+                    # 2. メディアのダウンロード（gallery-dlで処理）
                     self.logger.info(f"Downloading media for @{username}...")
-                    for tweet in new_tweets:
-                        all_media_paths = []
+                    
+                    # gallery-dlで取得したツイートはすでにメディア情報を持っている
+                    # twscrapeのみのツイートは基本的にメディアを持たない（テキストのみ）
+                    
+                    # gallery-dlでメディアをダウンロード
+                    if any(tweet.get('source') == 'gallery-dl' and (tweet.get('media') or tweet.get('videos')) for tweet in new_tweets):
+                        tweet_ids_with_media = [
+                            tweet['id'] for tweet in new_tweets 
+                            if tweet.get('source') == 'gallery-dl' and (tweet.get('media') or tweet.get('videos'))
+                        ]
                         
-                        if tweet.get('media'):
-                            downloaded_paths = await self.twitter_monitor.download_tweet_images(tweet)
-                            all_media_paths.extend(downloaded_paths)
-                            self.logger.info(f"Downloaded {len(downloaded_paths)} images for tweet {tweet['id']}")
-                        
-                        if tweet.get('videos'):
-                            downloaded_video_paths = await self.twitter_monitor.download_tweet_videos(tweet)
-                            all_media_paths.extend(downloaded_video_paths)
-                            self.logger.info(f"Downloaded {len(downloaded_video_paths)} videos for tweet {tweet['id']}")
-                        
-                        # local_mediaに画像と動画の両方を格納
-                        tweet['local_media'] = all_media_paths
+                        if tweet_ids_with_media:
+                            media_paths = self.twitter_monitor.gallery_dl_extractor.download_media_for_tweets(
+                                username, tweet_ids_with_media, move_to_images=True
+                            )
+                            
+                            # ダウンロードしたメディアパスをツイートに追加
+                            for tweet in new_tweets:
+                                if tweet['id'] in media_paths:
+                                    tweet['local_media'] = media_paths[tweet['id']]
+                                else:
+                                    tweet['local_media'] = []
+                    else:
+                        # メディアがない場合は空リスト
+                        for tweet in new_tweets:
+                            tweet['local_media'] = []
                     
                     # 3. データベースに保存（huggingface_urls=[]で初期化）
                     all_saved = self.db_manager.save_all_tweets(new_tweets, username)

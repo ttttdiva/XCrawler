@@ -178,6 +178,20 @@ class GalleryDLExtractor:
             # メディアURL
             media_url = data.get('url', '')
             
+            # URLドメインで画像と動画を分類（より確実）
+            media_list = []
+            video_list = []
+            if media_url:
+                if 'video.twimg.com' in media_url or 'amplify_video' in media_url:
+                    # 動画URL
+                    video_list.append(media_url)
+                elif 'pbs.twimg.com/media' in media_url:
+                    # 画像URL
+                    media_list.append(media_url)
+                else:
+                    # その他（デフォルトで画像扱い）
+                    media_list.append(media_url)
+            
             # ツイート情報を構築
             tweet = {
                 'id': str(tweet_id),
@@ -186,7 +200,8 @@ class GalleryDLExtractor:
                 'text': data.get('content', ''),
                 'date': date_iso,
                 'url': f"https://x.com/{username}/status/{tweet_id}",
-                'media': [media_url] if media_url else [],
+                'media': media_list,  # 画像URLのみ
+                'videos': video_list,  # 動画URLを別フィールドに
                 'source': 'gallery-dl',  # 取得元を記録
                 
                 # エンゲージメント情報
@@ -408,53 +423,124 @@ class GalleryDLExtractor:
         return final_tweet_media_paths
     
     def _move_to_images_dir(self, files: List[Path], username: str):
-        """ダウンロードしたファイルをimagesディレクトリに移動"""
+        """ダウンロードしたファイルを適切なディレクトリに移動（画像→images、動画→videos）"""
         try:
-            # imagesディレクトリを作成
+            # ディレクトリを作成
             images_dir = Path('images') / username
+            videos_dir = Path('videos') / username
             images_dir.mkdir(parents=True, exist_ok=True)
+            videos_dir.mkdir(parents=True, exist_ok=True)
             
-            moved_count = 0
+            # 動画・音声拡張子のリスト（videos/ディレクトリに保存）
+            video_extensions = {
+                # 動画
+                '.mp4', '.mov', '.avi', '.webm', '.mkv', '.flv', '.wmv', 
+                '.m4v', '.mpg', '.mpeg', '.3gp', '.3g2', '.ts', '.vob',
+                '.ogv', '.f4v', '.asf', '.rm', '.rmvb', '.m2ts', '.mts',
+                # ストリーミング
+                '.m3u8', '.m3u', 
+                # アニメーション
+                '.gif', '.gifv',
+                # 音声
+                '.mp3', '.m4a', '.wav', '.flac', '.aac', '.ogg', '.opus', 
+                '.wma', '.aiff', '.alac', '.oga'
+            }
+            
+            image_count = 0
+            video_count = 0
+            
             for src_file in files:
                 # ファイル名を取得（ツイートID_番号.拡張子）
                 filename = src_file.name
                 
-                # 移動先パス
-                dest_file = images_dir / filename
+                # ファイル内容で動画か画像かを判定
+                import mimetypes
+                import subprocess
                 
-                # 既に存在する場合はスキップ
-                if dest_file.exists():
-                    self.logger.debug(f"File already exists in images: {dest_file}")
-                    continue
+                try:
+                    # fileコマンドでファイルタイプを確認
+                    result = subprocess.run(['file', '--mime-type', '-b', str(src_file)], 
+                                          capture_output=True, text=True, timeout=5)
+                    mime_type = result.stdout.strip()
+                    is_video = mime_type.startswith('video/') or 'mp4' in mime_type.lower()
+                except:
+                    # フォールバック: 拡張子で判定
+                    is_video = src_file.suffix.lower() in video_extensions
                 
-                # ファイルを移動（コピーして元を削除）
-                shutil.copy2(src_file, dest_file)
-                moved_count += 1
-                self.logger.debug(f"Moved {src_file} to {dest_file}")
+                if is_video:
+                    # 動画ファイル→videos/
+                    dest_file = videos_dir / filename
+                    if dest_file.exists():
+                        self.logger.debug(f"Video already exists: {dest_file}")
+                        continue
+                    shutil.copy2(src_file, dest_file)
+                    video_count += 1
+                    self.logger.debug(f"Moved video {src_file} to {dest_file}")
+                else:
+                    # 画像ファイル→images/
+                    dest_file = images_dir / filename
+                    if dest_file.exists():
+                        self.logger.debug(f"Image already exists: {dest_file}")
+                        continue
+                    shutil.copy2(src_file, dest_file)
+                    image_count += 1
+                    self.logger.debug(f"Moved image {src_file} to {dest_file}")
             
-            self.logger.info(f"Moved {moved_count} files to images/{username}/")
+            self.logger.info(f"Moved {image_count} images to images/{username}/, {video_count} videos to videos/{username}/")
             
         except Exception as e:
-            self.logger.error(f"Failed to move files to images directory: {e}")
+            self.logger.error(f"Failed to move files: {e}")
     
     def _move_to_images_dir_with_mapping(self, files: List[Path], username: str) -> Dict[Path, Path]:
-        """ダウンロードしたファイルをimagesディレクトリに移動し、マッピングを返す"""
+        """ダウンロードしたファイルを適切なディレクトリに移動し、マッピングを返す"""
         mapping = {}
         try:
-            # imagesディレクトリを作成
+            # ディレクトリを作成
             images_dir = Path('images') / username
+            videos_dir = Path('videos') / username
             images_dir.mkdir(parents=True, exist_ok=True)
+            videos_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 動画・音声拡張子のリスト（videos/ディレクトリに保存）
+            video_extensions = {
+                # 動画
+                '.mp4', '.mov', '.avi', '.webm', '.mkv', '.flv', '.wmv', 
+                '.m4v', '.mpg', '.mpeg', '.3gp', '.3g2', '.ts', '.vob',
+                '.ogv', '.f4v', '.asf', '.rm', '.rmvb', '.m2ts', '.mts',
+                # ストリーミング
+                '.m3u8', '.m3u', 
+                # アニメーション
+                '.gif', '.gifv',
+                # 音声
+                '.mp3', '.m4a', '.wav', '.flac', '.aac', '.ogg', '.opus', 
+                '.wma', '.aiff', '.alac', '.oga'
+            }
             
             for src_file in files:
                 # ファイル名を取得（ツイートID_番号.拡張子）
                 filename = src_file.name
                 
-                # 移動先パス
-                dest_file = images_dir / filename
+                # ファイル内容で動画か画像かを判定
+                try:
+                    # fileコマンドでファイルタイプを確認
+                    result = subprocess.run(['file', '--mime-type', '-b', str(src_file)], 
+                                          capture_output=True, text=True, timeout=5)
+                    mime_type = result.stdout.strip()
+                    is_video = mime_type.startswith('video/') or 'mp4' in mime_type.lower()
+                except:
+                    # フォールバック: 拡張子で判定
+                    is_video = src_file.suffix.lower() in video_extensions
+                
+                if is_video:
+                    # 動画ファイル→videos/
+                    dest_file = videos_dir / filename
+                else:
+                    # 画像ファイル→images/
+                    dest_file = images_dir / filename
                 
                 # 既に存在する場合は既存ファイルをマッピング
                 if dest_file.exists():
-                    self.logger.debug(f"File already exists in images: {dest_file}")
+                    self.logger.debug(f"File already exists: {dest_file}")
                     mapping[src_file] = dest_file
                 else:
                     # ファイルを移動（コピーして元を削除）
@@ -462,10 +548,10 @@ class GalleryDLExtractor:
                     mapping[src_file] = dest_file
                     self.logger.debug(f"Moved {src_file} to {dest_file}")
             
-            self.logger.info(f"Processed {len(mapping)} files to images/{username}/")
+            self.logger.info(f"Processed {len(mapping)} files to appropriate directories")
             
         except Exception as e:
-            self.logger.error(f"Failed to move files to images directory: {e}")
+            self.logger.error(f"Failed to move files: {e}")
         
         return mapping
     

@@ -263,10 +263,9 @@ class HydrusClient:
                 logger.warning(f"画像ファイルが見つかりません: {image_path}")
                 continue
             
-            # 動画ファイルはスキップ
-            video_extensions = ['.mp4', '.mov', '.avi', '.webm', '.mkv', '.flv', '.wmv', '.m3u8']
-            if file_path.suffix.lower() in video_extensions:
-                logger.info(f"動画ファイルはhydrusインポートをスキップします: {file_path}")
+            # images/ディレクトリのファイルのみ処理（videos/は動画・音声ファイルなのでスキップ）
+            if '/images/' not in str(file_path):
+                logger.info(f"images/ディレクトリ外のファイルはスキップ: {file_path}")
                 continue
                 
             # ファイルをインポート（または既存ファイルのハッシュを取得）
