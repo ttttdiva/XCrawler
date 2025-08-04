@@ -697,9 +697,23 @@ class GalleryDLExtractor:
         # イベント判定が設定されていて有効な場合のみ実行
         event_tweets = []
         if self.event_detector and self.event_detector.enabled and event_detection_enabled:
-            self.logger.info(f"Running event detection on {len(tweets)} tweets from @{username}")
-            event_tweets = await self.event_detector.detect_event_tweets(tweets)
-            self.logger.info(f"Found {len(event_tweets)} event-related tweets for @{username}")
+            # DatabaseManagerを使用してall_tweetsテーブルの既存IDを確認
+            from .database import DatabaseManager
+            db_manager = DatabaseManager(self.config)
+            existing_tweet_ids = db_manager.get_existing_tweet_ids(username)
+            
+            # 既にall_tweetsテーブルに存在する（=過去に処理済み）ツイートを除外
+            new_tweets = [
+                tweet for tweet in tweets 
+                if tweet['id'] not in existing_tweet_ids
+            ]
+            
+            if new_tweets:
+                self.logger.info(f"Running event detection on {len(new_tweets)} new tweets from @{username} (skipping {len(tweets) - len(new_tweets)} already in DB)")
+                event_tweets = await self.event_detector.detect_event_tweets(new_tweets)
+                self.logger.info(f"Found {len(event_tweets)} event-related tweets for @{username}")
+            else:
+                self.logger.info(f"All {len(tweets)} tweets from @{username} already in DB, skipping event detection")
         else:
             if not event_detection_enabled:
                 self.logger.info(f"Event detection disabled for @{username}")

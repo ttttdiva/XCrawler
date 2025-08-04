@@ -301,14 +301,16 @@ class HydrusClient:
             # ツイート全文をnoteとして追加
             tweet_text = tweet_data.get('content') or tweet_data.get('text', '')
             if tweet_text:
-                # URLを除去してクリーンなテキストにする
-                cleaned_text = tweet_text.replace('\n', ' ').replace('\t', ' ').strip()
-                # 連続する空白を1つに圧縮
-                cleaned_text = ' '.join(cleaned_text.split())
+                # URLを除去してクリーンなテキストにする（改行は維持）
+                cleaned_text = tweet_text.strip()
+                # タブを空白に置換
+                cleaned_text = cleaned_text.replace('\t', ' ')
                 # t.coリンクを除去（TwitterのURL短縮）
                 cleaned_text = re.sub(r'https?://t\.co/\S+', '', cleaned_text).strip()
-                # 再度連続する空白を1つに圧縮
-                cleaned_text = ' '.join(cleaned_text.split())
+                # 各行の前後の空白を削除
+                lines = [line.strip() for line in cleaned_text.split('\n')]
+                # 空行を削除して結合
+                cleaned_text = '\n'.join(line for line in lines if line)
                 
                 if cleaned_text:
                     logger.info(f"Adding cleaned tweet text as note")
@@ -346,24 +348,21 @@ class HydrusClient:
             tweet_text = tweet_data.get('content') or tweet_data.get('text', '')
             logger.debug(f"Tweet text for title tag: {tweet_text[:100] if tweet_text else 'EMPTY'}")
             if tweet_text:
-                # 改行やタブを半角スペースに置換し、前後の空白を削除
-                cleaned_text = tweet_text.replace('\n', ' ').replace('\t', ' ').strip()
-                # 連続する空白を1つに圧縮
-                cleaned_text = ' '.join(cleaned_text.split())
-                
                 # t.coリンクを除去（TwitterのURL短縮）
-                cleaned_text = re.sub(r'https?://t\.co/\S+', '', cleaned_text).strip()
-                # 再度連続する空白を1つに圧縮
-                cleaned_text = ' '.join(cleaned_text.split())
+                cleaned_text = re.sub(r'https?://t\.co/\S+', '', tweet_text).strip()
                 
                 if cleaned_text:
                     # 最初の行のみを取得（改行で分割して最初の要素）
-                    first_line = cleaned_text.split(' ')[0:10]  # 最初の10単語まで
-                    first_line_text = ' '.join(first_line)
-                    if len(cleaned_text) > len(first_line_text):
-                        first_line_text += "..."  # 省略記号を追加
+                    first_line = cleaned_text.split('\n')[0].strip()
+                    # タブを空白に置換
+                    first_line = first_line.replace('\t', ' ')
+                    # 連続する空白を1つに圧縮
+                    first_line = ' '.join(first_line.split())
+                    # 最初の行が長すぎる場合は100文字で切る
+                    if len(first_line) > 100:
+                        first_line = first_line[:97] + "..."
                     
-                    title_tag = f"title:{first_line_text}"
+                    title_tag = f"title:{first_line}"
                     tags.append(title_tag)
                     logger.debug(f"Added title tag: {title_tag}")
                 else:

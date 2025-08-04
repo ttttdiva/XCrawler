@@ -211,15 +211,15 @@ class EventMonitor:
                             event_tweets.extend(gallery_event_in_new)
                             self.logger.info(f"Added {len(gallery_event_in_new)} gallery-dl event tweets for @{username}")
                         
-                        # gallery-dlで判定されていない新規ツイートをLLMで判定
-                        gallery_processed_ids = {tweet['id'] for tweet in gallery_event_tweets} if gallery_event_tweets else set()
+                        # gallery-dlで判定されていない新規ツイート（twscrapeのツイート）をLLMで判定
+                        # gallery-dlのツイートは既にLLM判定済みなので、sourceがgallery-dl以外のもののみ処理
                         remaining_tweets = [
                             tweet for tweet in new_tweets
-                            if tweet['id'] not in gallery_processed_ids
+                            if tweet.get('source') != 'gallery-dl'
                         ]
                         
                         if remaining_tweets:
-                            self.logger.info(f"Running LLM event detection on {len(remaining_tweets)} remaining tweets for @{username}")
+                            self.logger.info(f"Running LLM event detection on {len(remaining_tweets)} twscrape tweets for @{username}")
                             additional_event_tweets = await self.event_detector.detect_event_tweets(remaining_tweets)
                             event_tweets.extend(additional_event_tweets)
                         
