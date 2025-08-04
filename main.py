@@ -39,7 +39,7 @@ class EventMonitor:
         self.twitter_monitor = TwitterMonitor(self.config, self.db_manager, self.event_detector)
         self.discord_notifier = DiscordNotifier(self.config)
         self.backup_manager = BackupManager(self.config, self.db_manager)
-        self.hydrus_client = HydrusClient(self.config.get('hydrus', {}))
+        self.hydrus_client = HydrusClient(self.config)
         # backup_managerを参照として渡す
         self.log_only_uploader = LogOnlyHFUploader(self.config, self.db_manager, self.backup_manager)
         
@@ -98,11 +98,11 @@ class EventMonitor:
         # HydrusClientをコンテキストマネージャーとして使用
         async with self.hydrus_client:
             try:
-                # 0. 未アップロード分を最初に処理
-                if self.backup_manager.backup_config.get('enabled', False):
+                # 0. 未アップロード分を最初に処理（HuggingFaceまたはHydrusが有効な場合）
+                if self.backup_manager.backup_config.get('enabled', False) or self.hydrus_client.enabled:
                     try:
                         self.logger.info("Checking for unprocessed media in database...")
-                        await self.backup_manager.upload_remaining_media()
+                        await self.backup_manager.upload_remaining_media(hydrus_client=self.hydrus_client)
                         self.logger.info("Unprocessed media upload completed")
                     except Exception as e:
                         self.logger.error(f"Unprocessed media upload failed: {e}", exc_info=True)
@@ -187,31 +187,11 @@ class EventMonitor:
                         for tweet in new_tweets:
                             tweet['local_media'] = []
                     
-                    # 3. 一時的にツイートを保持（後でHFアップロード成功分のみDB保存）
-                    # all_saved = self.db_manager.save_all_tweets(new_tweets, username)
-                    # self.logger.info(f"Saved {all_saved} tweets to all_tweets table for @{username}")
+                    # 3. ツイートをデータベースに保存（初回保存、後でbackup_tweet_and_saveで更新される）
+                    all_saved = self.db_manager.save_all_tweets(new_tweets, username)
+                    self.logger.info(f"Saved {all_saved} tweets to all_tweets table for @{username}")
                     
-                    # 4. Hydrus連携（event_tweets_onlyがfalseの場合、全ツイートを対象）
-                    self.logger.info(f"Hydrus enabled: {self.hydrus_client.enabled}")
-                    self.logger.info(f"event_tweets_only: {self.hydrus_client.import_settings.get('event_tweets_only', True)}")
-                    if self.hydrus_client.enabled and not self.hydrus_client.import_settings.get('event_tweets_only', True):
-                        self.logger.info(f"Processing {len(new_tweets)} tweets for Hydrus import")
-                        for tweet in new_tweets:
-                            self.logger.info(f"Tweet {tweet['id']} has local_media: {bool(tweet.get('local_media'))}")
-                            if tweet.get('local_media'):
-                                try:
-                                    self.logger.info(f"Calling import_tweet_images for tweet {tweet['id']}")
-                                    imported = await self.hydrus_client.import_tweet_images(
-                                        tweet,
-                                        tweet['local_media']
-                                    )
-                                    self.logger.info(f"import_tweet_images returned: {imported}")
-                                    if imported:
-                                        self.logger.info(f"Imported {len(imported)} images to Hydrus for tweet {tweet['id']}")
-                                except Exception as e:
-                                    self.logger.error(f"Failed to import to Hydrus: {e}")
-                    
-                    # 5. イベント検知が有効な場合のみLLMで判定
+                    # 4. イベント検知が有効な場合のみLLMで判定
                     # config.yamlのevent_detection.enabledとアカウント個別の設定の両方をチェック
                     event_detection_enabled = (
                         self.config['event_detection'].get('enabled', True) and
@@ -243,43 +223,38 @@ class EventMonitor:
                             additional_event_tweets = await self.event_detector.detect_event_tweets(remaining_tweets)
                             event_tweets.extend(additional_event_tweets)
                         
-                        if not event_tweets:
-                            self.logger.info(f"No event-related tweets found for @{username}")
-                            continue
-                        
-                        # イベント関連ツイートをevent_tweetsテーブルに保存
-                        self.db_manager.save_event_tweets(event_tweets, username)
-                        
-                        # Discord通知とHydrus連携
-                        for tweet in event_tweets:
-                            await self.discord_notifier.send_notification(
-                                tweet, 
-                                username, 
-                                display_name
-                            )
+                        if event_tweets:
+                            # イベント関連ツイートをevent_tweetsテーブルに保存
+                            self.db_manager.save_event_tweets(event_tweets, username)
                             
-                            # Hydrus連携（イベントツイートの場合、event_tweets_onlyの設定に関わらず処理）
-                            if self.hydrus_client.enabled and tweet.get('local_media'):
-                                # event_tweets_onlyがtrueの場合、またはすでに処理済みでない場合のみ
-                                if self.hydrus_client.import_settings.get('event_tweets_only', True):
-                                    try:
+                            # Discord通知とHydrus連携
+                            for tweet in event_tweets:
+                                await self.discord_notifier.send_notification(
+                                    tweet, 
+                                    username, 
+                                    display_name
+                                )
+                                
+                                # Hydrus連携（event_tweets_onlyがTrueの場合のみ）
+                                if self.hydrus_client.enabled and tweet.get('local_media'):
+                                    if self.hydrus_client.import_settings.get('event_tweets_only', True):
                                         imported = await self.hydrus_client.import_tweet_images(
                                             tweet,
                                             tweet['local_media']
                                         )
                                         if imported:
                                             self.logger.info(f"Imported {len(imported)} images to Hydrus for tweet {tweet['id']}")
-                                    except Exception as e:
-                                        self.logger.error(f"Failed to import to Hydrus: {e}")
-                        
-                        self.logger.info(f"Processed {len(event_tweets)} new event tweets for @{username}")
+                            
+                            self.logger.info(f"Processed {len(event_tweets)} new event tweets for @{username}")
+                        else:
+                            self.logger.info(f"No event-related tweets found for @{username}")
                     else:
                         if not self.config['event_detection'].get('enabled', True):
                             self.logger.info("Event detection is globally disabled (crawler mode only)")
                         else:
                             self.logger.info(f"Event detection is disabled for @{username}, skipping LLM analysis")
                     
-                    # 6. HuggingFaceバックアップ処理と同時にDB保存（1ツイートずつ）
+                    # 5. HuggingFaceバックアップ処理とHydrusインポート
                     saved_count = 0
                     failed_count = 0
                     
@@ -289,8 +264,9 @@ class EventMonitor:
                     
                     for tweet in new_tweets:
                         try:
-                            # HFアップロード＆DB保存（成功時のみ）
-                            success = await self.backup_manager.backup_tweet_and_save(tweet, username, is_log_only=False)
+                            success = await self.backup_manager.backup_tweet_and_save(
+                                tweet, username, is_log_only=False, hydrus_client=self.hydrus_client
+                            )
                             if success:
                                 saved_count += 1
                                 self.logger.debug(f"Successfully processed tweet {tweet['id']}")
@@ -310,7 +286,7 @@ class EventMonitor:
                 # TwitterMonitorのクリーンアップ
                 await self.twitter_monitor.cleanup()
             
-            # 7. 全アカウント処理後、データベースファイルをバックアップ
+            # 6. 全アカウント処理後、データベースファイルをバックアップ
             if self.backup_manager.backup_config.get('enabled', False):
                 try:
                     self.logger.info("Uploading database backup...")

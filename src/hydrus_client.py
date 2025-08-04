@@ -10,7 +10,6 @@ from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
-logger.info("HydrusClient module loaded with updated code")
 
 
 class HydrusClient:
@@ -21,17 +20,19 @@ class HydrusClient:
         初期化
         
         Args:
-            config: hydrus設定セクション
+            config: 全体のconfig（hydrusセクションを含む）
         """
-        logger.info("HydrusClient.__init__ called")
-        self.enabled = config.get('enabled', False)
-        self.api_url = config.get('api_url', 'http://127.0.0.1:45869')
-        # 環境変数を優先、なければconfig.yamlから取得
-        self.access_key = os.environ.get('HYDRUS_ACCESS_KEY') or config.get('access_key')
-        self.tag_service_key = config.get('tag_service_key', '6c6f63616c2074616773')  # "local tags"
+        # hydrusセクションを取得
+        hydrus_config = config.get('hydrus', {})
         
-        self.import_settings = config.get('import_settings', {})
-        self.tag_settings = config.get('tag_settings', {})
+        self.enabled = hydrus_config.get('enabled', False)
+        self.api_url = hydrus_config.get('api_url', 'http://127.0.0.1:45869')
+        # 環境変数を優先、なければconfig.yamlから取得
+        self.access_key = os.environ.get('HYDRUS_ACCESS_KEY') or hydrus_config.get('access_key')
+        self.tag_service_key = hydrus_config.get('tag_service_key', '6c6f63616c2074616773')  # "local tags"
+        
+        self.import_settings = hydrus_config.get('import_settings', {})
+        self.tag_settings = hydrus_config.get('tag_settings', {})
         
         self.session: Optional[aiohttp.ClientSession] = None
         self._session_key: Optional[str] = None
@@ -102,11 +103,14 @@ class HydrusClient:
             # ファイルハッシュを計算
             file_hash = self._calculate_file_hash(file_path)
             
-            # 既存チェック
+            # 既存チェック（メタデータがあるかも確認）
             if self.import_settings.get('skip_existing', True):
-                exists = await self._check_file_exists(file_hash)
-                if exists:
-                    logger.info(f"ファイルは既にHydrusに存在: {file_path}")
+                exists, has_metadata = await self._check_file_exists_with_metadata(file_hash)
+                if exists and has_metadata:
+                    logger.info(f"ファイルは既にHydrusに存在し、メタデータもあります: {file_path}")
+                    return file_hash
+                elif exists and not has_metadata:
+                    logger.info(f"ファイルは存在しますが、メタデータが削除されています。再インポートをスキップしてタグのみ追加します: {file_path}")
                     return file_hash
             
             # ファイルをインポート
@@ -264,7 +268,7 @@ class HydrusClient:
                 continue
             
             # images/ディレクトリのファイルのみ処理（videos/は動画・音声ファイルなのでスキップ）
-            if '/images/' not in str(file_path):
+            if 'images/' not in str(file_path) and not str(file_path).startswith('images/'):
                 logger.info(f"images/ディレクトリ外のファイルはスキップ: {file_path}")
                 continue
                 
@@ -447,6 +451,55 @@ class HydrusClient:
                     return False
         except:
             return False
+    
+    async def _check_file_exists_with_metadata(self, file_hash: str) -> tuple[bool, bool]:
+        """ファイルの存在とメタデータ（タグ）の有無をチェック
+        
+        Returns:
+            (ファイルが存在するか, メタデータがあるか)
+        """
+        try:
+            headers = self._get_headers()
+            params = {'hash': file_hash}
+            
+            async with self.session.get(
+                f"{self.api_url}/get_files/file_metadata",
+                headers=headers,
+                params=params
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get('metadata'):
+                        metadata = data['metadata'][0]
+                        is_local = metadata.get('is_local', False)
+                        
+                        if not is_local:
+                            logger.debug(f"ファイルメタデータは存在するが、ローカルには存在しない: {file_hash}")
+                            return (False, False)
+                        
+                        # タグの存在をチェック
+                        service_keys_to_tags = metadata.get('service_keys_to_statuses_to_display_tags', {})
+                        has_tags = False
+                        
+                        if self.tag_service_key in service_keys_to_tags:
+                            tag_data = service_keys_to_tags[self.tag_service_key]
+                            current_tags = tag_data.get('0', [])
+                            # EventMonitor由来のタグがあるかチェック
+                            eventmonitor_tags = [tag for tag in current_tags if 'eventmonitor' in tag.lower() or 'creator:' in tag or 'title:' in tag]
+                            has_tags = len(eventmonitor_tags) > 0
+                            
+                            if has_tags:
+                                logger.debug(f"ファイルには既にEventMonitorのタグが存在します: {len(eventmonitor_tags)}個")
+                            else:
+                                logger.debug(f"ファイルは存在しますが、EventMonitorのタグがありません")
+                        
+                        return (True, has_tags)
+                    return (False, False)
+                else:
+                    return (False, False)
+        except Exception as e:
+            logger.error(f"ファイル存在チェックエラー: {e}")
+            return (False, False)
     
     async def _undelete_file(self, file_hash: str) -> bool:
         """削除されたファイルを復元"""

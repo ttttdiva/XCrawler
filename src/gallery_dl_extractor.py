@@ -401,8 +401,9 @@ class GalleryDLExtractor:
             try:
                 import os
                 os.unlink(url_file_path)
-            except:
-                pass
+                self.logger.debug(f"Deleted temporary URL file: {url_file_path}")
+            except Exception as e:
+                self.logger.warning(f"Failed to delete temporary file {url_file_path}: {e}")
         
         # imagesディレクトリに移動し、最終パスを更新
         final_tweet_media_paths = {}

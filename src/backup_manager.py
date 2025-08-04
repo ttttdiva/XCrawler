@@ -285,22 +285,26 @@ class BackupManager:
             self.logger.error(f"Failed to ensure repository exists: {e}")
             raise
     
-    async def backup_tweet_and_save(self, tweet: Dict[str, Any], username: str, is_log_only: bool = False) -> bool:
+    async def backup_tweet_and_save(self, tweet: Dict[str, Any], username: str, is_log_only: bool = False, hydrus_client=None) -> bool:
         """単一ツイートのメディアをHugging Faceにバックアップし、成功したらDBに保存
         
         Args:
             tweet: バックアップ対象のツイート
             username: ユーザー名
             is_log_only: Trueの場合log_only_tweetsテーブル、Falseの場合all_tweetsテーブル
+            hydrus_client: HydrusClient インスタンス（監視アカウントの場合に使用）
             
         Returns:
             bool: 処理成功の場合True
         """
+        
         # logアカウントは設定に関わらず常にアップロード
         if not is_log_only and not self.backup_config.get('enabled', False):
-            # 通常アカウントでバックアップ無効の場合はDBに保存だけして成功とする
-            if self.db_manager:
-                return self.db_manager.save_single_tweet(tweet, username)
+            # 通常アカウントでバックアップ無効の場合はHydrusインポートのみ実行
+            if hydrus_client and hydrus_client.enabled and tweet.get('local_media'):
+                imported = await hydrus_client.import_tweet_images(tweet, tweet['local_media'])
+                if imported:
+                    self.logger.info(f"Imported {len(imported)} images to Hydrus for tweet {tweet['id']}")
             return True
             
         try:
@@ -343,6 +347,12 @@ class BackupManager:
                 # DB保存成功後にHF URLsを更新
                 if hf_urls:
                     self._update_tweet_hf_urls_batch(tweet_id, hf_urls, is_log_only=is_log_only)
+            
+            # 監視アカウントの場合、Hydrusインポートを実行
+            if not is_log_only and hydrus_client and hydrus_client.enabled and tweet.get('local_media'):
+                imported = await hydrus_client.import_tweet_images(tweet, tweet['local_media'])
+                if imported:
+                    self.logger.info(f"Imported {len(imported)} images to Hydrus for tweet {tweet_id}")
             
             # アップロード成功後、ログアカウントの場合のみローカルファイルを削除
             if is_log_only and tweet.get('local_media'):
@@ -495,14 +505,23 @@ class BackupManager:
                 except Exception as e:
                     self.logger.warning(f"Failed to delete temp file: {e}")
     
-    async def upload_remaining_media(self):
-        """DBに保存済みだがHuggingFaceに未アップロードのメディアをアップロード"""
+    async def upload_remaining_media(self, hydrus_client=None):
+        """DBに保存済みだがHuggingFaceに未アップロードのメディアをアップロード
+        
+        Args:
+            hydrus_client: HydrusClientインスタンス（オプション）
+        """
+        # HuggingFaceバックアップが無効な場合は何も実行しない
+        if not self.backup_config.get('enabled', False):
+            self.logger.info("HuggingFace backup is disabled, skipping upload_remaining_media")
+            return
+            
         try:
             self.logger.info("Starting upload of remaining media to HuggingFace...")
             
             # データベースから未アップロード分を取得
             if self.db_manager:
-                await self._upload_remaining_from_db()
+                await self._upload_remaining_from_db(hydrus_client=hydrus_client)
             
             # リポジトリの存在確認
             self._ensure_repo_exists()
@@ -516,8 +535,12 @@ class BackupManager:
             self.logger.error(f"Failed to upload remaining media: {e}")
             raise
     
-    async def _upload_remaining_from_db(self):
-        """データベースから未アップロード分を取得して処理"""
+    async def _upload_remaining_from_db(self, hydrus_client=None):
+        """データベースから未アップロード分を取得して処理
+        
+        Args:
+            hydrus_client: HydrusClientインスタンス（オプション）
+        """
         try:
             from .database import AllTweets
             import json
@@ -570,6 +593,7 @@ class BackupManager:
                     
                     # バックアップ処理を実行
                     await self.backup_tweets([tweet_data])
+                    
                     processed_count += 1
                     
                     if processed_count % 10 == 0:
@@ -1101,6 +1125,7 @@ class BackupManager:
                         continue
                     
                     # デバッグログ
+                    tweet_id = image_file.stem.split('_')[0]
                     self.logger.debug(f"Will encrypt: {relative_path} (tweet_id: {tweet_id})")
                     files_to_encrypt[image_file] = Path(relative_path)
         
@@ -1265,6 +1290,7 @@ class BackupManager:
                             continue
                         
                         # デバッグログ
+                        tweet_id = video_file.stem.split('_')[0]
                         self.logger.info(f"Will encrypt video: {relative_path} (tweet_id: {tweet_id})")
                         files_to_encrypt[video_file] = Path(relative_path)
         
