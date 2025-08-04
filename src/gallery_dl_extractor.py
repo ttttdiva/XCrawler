@@ -74,12 +74,13 @@ class GalleryDLExtractor:
         
         try:
             # gallery-dl実行（標準エラー出力を破棄）
+            # JSONデータ取得は軽量なので長めのタイムアウトを設定
             result = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,  # エラー出力を破棄
                 text=True,
-                timeout=300  # 5分のタイムアウト
+                timeout=3600  # 1時間のタイムアウト（JSONデータ取得は時間制限なし）
             )
             
             if result.returncode != 0:
@@ -292,9 +293,25 @@ class GalleryDLExtractor:
             self.logger.error(f"Error downloading media: {e}")
             return False
     
+    def _collect_downloaded_files(self, tweet_ids: List[str], output_dir: Path, existing_files: set) -> Dict[str, List[Path]]:
+        """ダウンロード済みファイルを収集"""
+        new_files_by_tweet = {}
+        if output_dir.exists():
+            for file in output_dir.rglob('*'):
+                if file.is_file() and file not in existing_files:
+                    filename = file.name
+                    if '_' in filename:
+                        tweet_id_part = filename.split('_')[0]
+                        if tweet_id_part in tweet_ids:
+                            if tweet_id_part not in new_files_by_tweet:
+                                new_files_by_tweet[tweet_id_part] = []
+                            new_files_by_tweet[tweet_id_part].append(file)
+        return new_files_by_tweet
+
     def download_media_for_tweets(self, username: str, tweet_ids: List[str], output_dir: Optional[Path] = None, move_to_images: bool = True) -> Dict[str, List[str]]:
         """
         特定のツイートIDのメディアのみをダウンロード
+        タイムアウト時はCookieを切り替えて再試行
         
         Args:
             username: Twitter username
@@ -313,97 +330,144 @@ class GalleryDLExtractor:
         
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Cookieファイルを取得（ローテーション）
-        cookie_file = self.cookie_rotator.get_next_cookie()
-        if not cookie_file:
-            cookie_file = self.default_cookie_file
+        # ダウンロード設定
+        remaining_tweet_ids = tweet_ids.copy()
+        all_tweet_media_paths = {}
+        all_downloaded_files = []
+        timeout_per_batch = 300  # 5分でタイムアウト
+        consecutive_no_progress = 0  # 連続して進捗なしの回数
+        max_no_progress = 10  # 10回連続で進捗なしなら諦める
         
-        # 一時的なURLリストファイルを作成
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as url_file:
-            for tweet_id in tweet_ids:
-                url = f"https://x.com/{username}/status/{tweet_id}"
-                url_file.write(url + '\n')
-            url_file_path = url_file.name
-        
-        # ダウンロード前のファイルリストを取得
+        # ダウンロード前のファイルリストを取得（一度だけ）
         existing_files = set()
         if output_dir.exists():
             for file in output_dir.rglob('*'):
                 if file.is_file():
                     existing_files.add(file)
         
-        try:
-            # gallery-dlコマンドを構築（バッチダウンロード用）
-            cmd = [
-                sys.executable,
-                str(self.wrapper_path),
-                '--cookies', str(cookie_file),
-                '-d', str(output_dir),  # 出力先ディレクトリ
-                '-q',  # Quietモード
-                '--input-file', url_file_path  # URLリストファイル
-            ]
+        retry = 0
+        while remaining_tweet_ids and consecutive_no_progress < max_no_progress:
+            retry += 1
             
-            self.logger.info(f"Downloading media for {len(tweet_ids)} tweets in batch mode")
+            # Cookieファイルを取得（ローテーション）
+            cookie_file = self.cookie_rotator.get_next_cookie()
+            if not cookie_file:
+                cookie_file = self.default_cookie_file
+                self.logger.warning(f"No cookie available for rotation, using default")
             
-            # gallery-dlを一度だけ実行（すべてのURLを処理）
-            # レート制限を考慮して十分な時間を設定（2時間）
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=7200  # 2時間のタイムアウト
-            )
+            self.logger.info(f"Attempt {retry}: Downloading {len(remaining_tweet_ids)} tweets with cookie: {cookie_file}")
             
-            if result.returncode != 0:
-                self.logger.warning(f"gallery-dl batch download had issues: {result.stderr}")
+            # 一時的なURLリストファイルを作成
+            import tempfile
+            import os
+            url_file_path = None
             
-            # ダウンロード後のファイルリストを取得
-            new_files_by_tweet = {}
-            if output_dir.exists():
-                # gallery-dlはtwitter/username/tweet_id_*.* 形式でファイルを保存
-                for file in output_dir.rglob('*'):
-                    if file.is_file() and file not in existing_files:
-                        # ファイル名からツイートIDを抽出
-                        filename = file.name
-                        # tweet_id_番号.拡張子 形式
-                        if '_' in filename:
-                            tweet_id_part = filename.split('_')[0]
-                            if tweet_id_part in tweet_ids:
-                                if tweet_id_part not in new_files_by_tweet:
-                                    new_files_by_tweet[tweet_id_part] = []
-                                new_files_by_tweet[tweet_id_part].append(file)
-            
-            # ログ出力
-            total_files = sum(len(files) for files in new_files_by_tweet.values())
-            self.logger.info(f"Successfully downloaded {total_files} files for {len(new_files_by_tweet)} tweets")
-            
-            for tweet_id, files in new_files_by_tweet.items():
-                self.logger.debug(f"Tweet {tweet_id}: {len(files)} files")
-            
-            # すべてのダウンロードされたファイルを収集
-            all_downloaded_files = []
-            for files in new_files_by_tweet.values():
-                all_downloaded_files.extend(files)
-            
-            tweet_media_paths = new_files_by_tweet
-            
-        except subprocess.TimeoutExpired:
-            self.logger.error(f"Timeout downloading media batch")
-            tweet_media_paths = {}
-            all_downloaded_files = []
-        except Exception as e:
-            self.logger.error(f"Error downloading media batch: {e}")
-            tweet_media_paths = {}
-            all_downloaded_files = []
-        finally:
-            # 一時ファイルを削除
             try:
-                import os
-                os.unlink(url_file_path)
-                self.logger.debug(f"Deleted temporary URL file: {url_file_path}")
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as url_file:
+                    for tweet_id in remaining_tweet_ids:
+                        url = f"https://x.com/{username}/status/{tweet_id}"
+                        url_file.write(url + '\n')
+                    url_file_path = url_file.name
+                
+                # gallery-dlコマンドを構築（メディアダウンロード用）
+                cmd = [
+                    sys.executable,
+                    str(self.wrapper_path),
+                    '--cookies', str(cookie_file),
+                    '-d', str(output_dir),
+                    '-q',
+                    '--input-file', url_file_path
+                ]
+                
+                # gallery-dl実行（メディアダウンロードは5分タイムアウト）
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_per_batch
+                )
+                
+                if result.returncode != 0:
+                    self.logger.warning(f"gallery-dl had issues: {result.stderr[:200]}")
+                
+                # 成功分を収集
+                new_files_by_tweet = self._collect_downloaded_files(
+                    remaining_tweet_ids, output_dir, existing_files
+                )
+                
+                if new_files_by_tweet:
+                    total_files = sum(len(files) for files in new_files_by_tweet.values())
+                    self.logger.info(f"Downloaded {total_files} files for {len(new_files_by_tweet)} tweets")
+                    
+                    # 全体の結果に追加
+                    all_tweet_media_paths.update(new_files_by_tweet)
+                    for files in new_files_by_tweet.values():
+                        all_downloaded_files.extend(files)
+                    
+                    # 成功分を除外
+                    remaining_tweet_ids = [tid for tid in remaining_tweet_ids if tid not in new_files_by_tweet]
+                    
+                    # 既存ファイルセットを更新
+                    for files in new_files_by_tweet.values():
+                        existing_files.update(files)
+                    
+                    # 進捗があったのでカウンタをリセット
+                    consecutive_no_progress = 0
+                else:
+                    self.logger.warning(f"No new files downloaded in attempt {retry}")
+                    consecutive_no_progress += 1
+                
+            except subprocess.TimeoutExpired:
+                self.logger.warning(f"Timeout after {timeout_per_batch/60:.1f} minutes on attempt {retry}")
+                
+                # タイムアウト時も部分的な成功を収集
+                partial_files = self._collect_downloaded_files(
+                    remaining_tweet_ids, output_dir, existing_files
+                )
+                
+                if partial_files:
+                    total_files = sum(len(files) for files in partial_files.values())
+                    self.logger.info(f"Partial success: {total_files} files for {len(partial_files)} tweets before timeout")
+                    
+                    all_tweet_media_paths.update(partial_files)
+                    for files in partial_files.values():
+                        all_downloaded_files.extend(files)
+                    
+                    remaining_tweet_ids = [tid for tid in remaining_tweet_ids if tid not in partial_files]
+                    
+                    for files in partial_files.values():
+                        existing_files.update(files)
+                    
+                    # 部分的でも進捗があったのでリセット
+                    consecutive_no_progress = 0
+                else:
+                    self.logger.warning(f"No progress even after timeout")
+                    consecutive_no_progress += 1
+                
+                self.logger.info(f"Switching to next cookie for retry...")
+                    
             except Exception as e:
-                self.logger.warning(f"Failed to delete temporary file {url_file_path}: {e}")
+                self.logger.error(f"Error in attempt {retry}: {e}")
+                consecutive_no_progress += 1
+                
+            finally:
+                # 一時ファイルを削除
+                if url_file_path:
+                    try:
+                        os.unlink(url_file_path)
+                        self.logger.debug(f"Deleted temporary URL file: {url_file_path}")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to delete temporary file: {e}")
+        
+        # 最終結果のログ
+        if remaining_tweet_ids:
+            if consecutive_no_progress >= max_no_progress:
+                self.logger.error(f"Stopped after {max_no_progress} consecutive attempts with no progress")
+            self.logger.error(f"Failed to download media for {len(remaining_tweet_ids)} tweets after {retry} attempts")
+            self.logger.debug(f"Failed tweet IDs: {remaining_tweet_ids[:10]}...")
+        
+        total_success = sum(len(files) for files in all_tweet_media_paths.values())
+        self.logger.info(f"Total download result: {total_success} files for {len(all_tweet_media_paths)}/{len(tweet_ids)} tweets")
         
         # imagesディレクトリに移動し、最終パスを更新
         final_tweet_media_paths = {}
@@ -411,13 +475,19 @@ class GalleryDLExtractor:
             moved_paths = self._move_to_images_dir_with_mapping(all_downloaded_files, username)
             
             # ツイートIDごとに最終パスを更新
-            for tweet_id, original_files in tweet_media_paths.items():
+            for tweet_id, original_files in all_tweet_media_paths.items():
                 final_paths = []
                 for orig_file in original_files:
                     if orig_file in moved_paths:
                         final_paths.append(str(moved_paths[orig_file]))
                 if final_paths:
                     final_tweet_media_paths[tweet_id] = final_paths
+        else:
+            # 移動しない場合はパスを文字列に変換
+            final_tweet_media_paths = {
+                tid: [str(f) for f in files] 
+                for tid, files in all_tweet_media_paths.items()
+            }
         
         # ダウンロードしたファイルを削除
         self._cleanup_media_dir()
