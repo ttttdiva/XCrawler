@@ -45,7 +45,7 @@ tweet_settings:
 # イベント判定設定
 event_detection:
   # イベント検出機能を有効にするか（false: クローラーとしてのみ動作）
-  enabled: true
+  enabled: false
   # イベント関連キーワード
   keywords:
     - "参加"
@@ -104,7 +104,7 @@ huggingface_backup:
 # Hydrus Client連携設定
 hydrus:
   # 連携を有効にするか
-  enabled: true
+  enabled: false
   # Hydrus Client APIのURL
   api_url: "http://127.0.0.1:45869"
   # インポート設定
