@@ -53,13 +53,13 @@ def make_client_with_timeout(self, proxy: str | None = None) -> AsyncClient:
     proxies = [x for x in proxies if x is not None]
     proxy = proxies[0] if proxies else None
     
-    # タイムアウトを設定（30秒）
+    # タイムアウトを設定（180秒に延長）
     transport = AsyncHTTPTransport(retries=2)
     client = AsyncClient(
         proxy=proxy, 
         follow_redirects=True, 
         transport=transport,
-        timeout=httpx.Timeout(30.0, connect=10.0)  # 30秒のread timeout、10秒のconnect timeout
+        timeout=httpx.Timeout(180.0, connect=30.0)  # 180秒のread timeout、30秒のconnect timeout
     )
     
     # saved from previous usage
@@ -91,6 +91,10 @@ class TwitterMonitor:
         self._session = None
         self.db_manager = db_manager
         self._timeout_seconds = 300  # 5分のタイムアウト
+        
+        # リトライカウンタを初期化
+        self._tweet_retry_count = 0
+        self._http_retry_count = 0
         
         # gallery-dl extractorを初期化
         from .gallery_dl_extractor import GalleryDLExtractor
@@ -295,45 +299,39 @@ class TwitterMonitor:
             latest_date_override: 効率化のため外部から指定された最新日時
             latest_id_override: 効率化のため外部から指定された最新ID
         """
-        # リトライ設定
+        # リトライ処理（最大3回）
         max_retries = 3
         retry_count = 0
-        all_collected_tweets = []  # 全リトライで収集したツイート
         
         while retry_count < max_retries:
             try:
-                tweets = await self._get_user_tweets_twscrape_internal(
+                return await self._get_user_tweets_twscrape_internal(
                     username, days_lookback, force_full_fetch, 
-                    latest_date_override, latest_id_override,
-                    collected_tweets=all_collected_tweets
+                    latest_date_override, latest_id_override
                 )
-                # 成功した場合はリトライを終了
-                return tweets
-                
             except TimeoutError as e:
                 retry_count += 1
                 if retry_count < max_retries:
                     self.logger.warning(f"twscrape: Timeout for @{username}, retry {retry_count}/{max_retries}")
-                    # リトライ前に少し待機
-                    await asyncio.sleep(5)
+                    
+                    # アカウントローテーションを試行
+                    try:
+                        await self._rotate_account()
+                        self.logger.info(f"twscrape: Rotated to next account for retry {retry_count}")
+                    except Exception as rotate_error:
+                        self.logger.warning(f"twscrape: Failed to rotate account: {rotate_error}")
+                    
+                    await asyncio.sleep(10 * retry_count)  # 10秒, 20秒, 30秒
                 else:
                     self.logger.error(f"twscrape: Max retries reached for @{username}")
-                    # 最大リトライ数に達した場合、収集済みツイートを返す
-                    if all_collected_tweets:
-                        self.logger.info(f"twscrape: Returning {len(all_collected_tweets)} partially collected tweets for @{username}")
-                        return self._process_collected_tweets(all_collected_tweets)
                     raise e
-                    
             except Exception as e:
-                self.logger.error(f"twscrape: Unexpected error for @{username}: {e}")
-                if all_collected_tweets:
-                    self.logger.info(f"twscrape: Returning {len(all_collected_tweets)} partially collected tweets for @{username}")
-                    return self._process_collected_tweets(all_collected_tweets)
-                raise e
+                self.logger.error(f"twscrape: Error for @{username}: {e}")
+                return []
                 
-        return []  # 全て失敗した場合
+        return []
     
-    async def _get_user_tweets_twscrape_internal(self, username: str, days_lookback: int = 365, force_full_fetch: bool = False, latest_date_override=None, latest_id_override=None, collected_tweets=None) -> List[Dict[str, Any]]:
+    async def _get_user_tweets_twscrape_internal(self, username: str, days_lookback: int = 365, force_full_fetch: bool = False, latest_date_override=None, latest_id_override=None) -> List[Dict[str, Any]]:
         """
         twscrapeの内部実装（タイムアウトエラーを投げる）
         """
@@ -375,10 +373,7 @@ class TwitterMonitor:
         else:
             self.logger.info(f"twscrape: Force full fetch enabled for @{username}, fetching ALL tweets since {since_date.strftime('%Y-%m-%d')} with duplicate checking")
         
-        # 既に収集されたツイートIDを追跡
-        if collected_tweets is None:
-            collected_tweets = []
-        collected_tweet_ids = {tweet['id'] for tweet in collected_tweets}
+        # collected_tweets処理を削除（簡素化）
         
         try:
             # First, resolve username to user ID
@@ -440,21 +435,19 @@ class TwitterMonitor:
                 total_fetched = 0
             
             start_time = time.time()
-            http_retry_count = 0
-            max_http_retries = 3
+            
+            # イテレータ自体にタイムアウトを設定
             tweet_iterator = self.api.user_tweets(user.id).__aiter__()
             
             while True:
                 try:
-                    # タイムアウトチェック
-                    if time.time() - start_time > self._timeout_seconds:
-                        self.logger.error(f"twscrape: Timeout after {self._timeout_seconds}s while fetching tweets for @{username}")
-                        # 収集済みツイートをcollected_tweetsに追加
-                        collected_tweets.extend(tweets)
-                        raise TimeoutError(f"Timeout while fetching tweets for @{username}")
+                    # 各ツイート取得に30秒のタイムアウトを設定
+                    tweet = await asyncio.wait_for(tweet_iterator.__anext__(), timeout=30.0)
                     
-                    # 次のツイートを取得
-                    tweet = await tweet_iterator.__anext__()
+                    # 全体のタイムアウトチェック
+                    if time.time() - start_time > self._timeout_seconds:
+                        self.logger.error(f"twscrape: Overall timeout after {self._timeout_seconds}s while fetching tweets for @{username}")
+                        raise TimeoutError(f"Overall timeout while fetching tweets for @{username}")
                     
                     total_fetched += 1
                     self.logger.debug(f"twscrape: Tweet {total_fetched}: ID={tweet.id}, Date={tweet.date}")
@@ -484,7 +477,7 @@ class TwitterMonitor:
                     
                     # 既存ツイートとの重複チェック
                     tweet_id_str = str(tweet.id)
-                    if tweet_id_str in existing_tweet_ids or tweet_id_str in collected_tweet_ids:
+                    if tweet_id_str in existing_tweet_ids:
                         self.logger.debug(f"twscrape: Skipping duplicate tweet: {tweet.id}")
                         continue
                     
@@ -524,53 +517,74 @@ class TwitterMonitor:
                     tweets.append(tweet_data)
                     tweet_count += 1
                     
+                    # ツイート取得成功時にリトライカウンタをリセット
+                    self._tweet_retry_count = 0
+                    self._http_retry_count = 0
+                    
                     if tweet_count % 100 == 0:
                         self.logger.debug(f"twscrape: Fetched {tweet_count} tweets so far...")
                         
-                    # HTTPリトライカウントをリセット（成功した場合）
-                    http_retry_count = 0
-                    
                 except StopAsyncIteration:
-                    # イテレータが終了（全ツイート取得完了）
+                    # イテレータ終了
                     self.logger.debug(f"twscrape: Reached end of tweets for @{username}")
                     break
                     
-                except (httpx.ReadTimeout, httpx.ConnectTimeout) as e:
-                    http_retry_count += 1
-                    if http_retry_count >= max_http_retries:
-                        self.logger.error(f"twscrape: Max HTTP retries ({max_http_retries}) reached for @{username}: {e}")
-                        # 収集済みツイートを保存してから終了
-                        collected_tweets.extend(tweets)
-                        raise TimeoutError(f"HTTP timeout after {max_http_retries} retries for @{username}")
-                    else:
-                        self.logger.warning(f"twscrape: HTTP timeout for @{username}, retry {http_retry_count}/{max_http_retries}: {e}")
-                        # 少し待機してからリトライ
-                        await asyncio.sleep(2 ** http_retry_count)  # 指数バックオフ: 2秒, 4秒, 8秒
-                        # 新しいイテレータを作成して続行
+                except asyncio.TimeoutError:
+                    # 個別ツイート取得のタイムアウト - ローテーションしてリトライ
+                    self.logger.warning(f"twscrape: Tweet fetch timeout after 30s")
+                    
+                    # 個別ツイートレベルでのリトライ（最大2回）
+                    tweet_retry_count = getattr(self, '_tweet_retry_count', 0)
+                    if tweet_retry_count < 2:
+                        self._tweet_retry_count = tweet_retry_count + 1
+                        self.logger.info(f"twscrape: Individual tweet retry {self._tweet_retry_count}/2")
+                        
+                        # アカウントローテーション
                         try:
-                            tweet_iterator = self.api.user_tweets(user.id).__aiter__()
-                            # 既に取得したツイートまでスキップ
-                            if tweets:
-                                last_tweet_id = int(tweets[-1]['id'])
-                                self.logger.info(f"twscrape: Resuming from tweet ID {last_tweet_id}")
-                                skip_count = 0
-                                async for skip_tweet in self.api.user_tweets(user.id):
-                                    skip_count += 1
-                                    if int(skip_tweet.id) <= last_tweet_id:
-                                        self.logger.debug(f"twscrape: Skipped {skip_count} tweets to resume")
-                                        break
-                                tweet_iterator = self.api.user_tweets(user.id).__aiter__()
-                        except Exception as e2:
-                            self.logger.error(f"twscrape: Failed to create new iterator: {e2}")
-                            collected_tweets.extend(tweets)
-                            raise
+                            await self._rotate_account()
+                            self.logger.info(f"twscrape: Rotated account for individual tweet retry")
+                        except Exception as rotate_error:
+                            self.logger.warning(f"twscrape: Failed to rotate account for tweet retry: {rotate_error}")
+                        
+                        # 短時間待機後にリトライ（同じツイートを再試行）
+                        await asyncio.sleep(5)
+                        continue
+                    else:
+                        # 最大リトライ数に達したら次のツイートに進む
+                        self.logger.warning(f"twscrape: Max individual tweet retries reached, skipping to next tweet")
+                        self._tweet_retry_count = 0  # カウンタリセット
+                        continue
+                    
+                except (httpx.ReadTimeout, httpx.ConnectTimeout) as e:
+                    # HTTPタイムアウト - ローテーションしてリトライ
+                    self.logger.warning(f"twscrape: HTTP timeout: {e}")
+                    
+                    # HTTPレベルでのリトライ（最大2回）
+                    http_retry_count = getattr(self, '_http_retry_count', 0)
+                    if http_retry_count < 2:
+                        self._http_retry_count = http_retry_count + 1
+                        self.logger.info(f"twscrape: HTTP retry {self._http_retry_count}/2")
+                        
+                        # アカウントローテーション
+                        try:
+                            await self._rotate_account()
+                            self.logger.info(f"twscrape: Rotated account for HTTP retry")
+                        except Exception as rotate_error:
+                            self.logger.warning(f"twscrape: Failed to rotate account for HTTP retry: {rotate_error}")
+                        
+                        # 指数バックオフで待機
+                        await asyncio.sleep(2 ** self._http_retry_count)  # 2秒, 4秒
+                        continue
+                    else:
+                        # 最大リトライ数に達したら次のツイートに進む
+                        self.logger.warning(f"twscrape: Max HTTP retries reached, skipping to next tweet") 
+                        self._http_retry_count = 0  # カウンタリセット
                         continue
                         
                 except Exception as e:
-                    # その他の予期しないエラー
-                    self.logger.error(f"twscrape: Unexpected error while fetching tweets: {e}")
-                    collected_tweets.extend(tweets)
-                    raise
+                    # その他のエラー
+                    self.logger.warning(f"twscrape: Error processing tweet: {e}")
+                    continue
             
             # 重複を除去
             unique_tweets = []
@@ -593,18 +607,6 @@ class TwitterMonitor:
             if isinstance(e, TimeoutError):
                 raise e
             return []
-    
-    def _process_collected_tweets(self, collected_tweets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """収集済みツイートの重複除去と処理"""
-        unique_tweets = []
-        seen_ids = set()
-        for tweet in collected_tweets:
-            if tweet['id'] not in seen_ids:
-                unique_tweets.append(tweet)
-                seen_ids.add(tweet['id'])
-        
-        self.logger.info(f"Processing {len(unique_tweets)} unique tweets from {len(collected_tweets)} collected tweets")
-        return unique_tweets
     
     async def get_user_tweets(self, username: str, days_lookback: int = 365, force_full_fetch: bool = False) -> List[Dict[str, Any]]:
         """指定ユーザーのツイートを取得（リツイート除く）"""
@@ -957,6 +959,47 @@ class TwitterMonitor:
             self.logger.error(f"Error fetching tweet {tweet_id}: {e}")
             return None
     
+    async def _rotate_account(self):
+        """次のアカウントにローテーション"""
+        try:
+            # 現在のアカウント情報を取得
+            current_accounts = await self.api.pool.accounts_info()
+            active_accounts = [acc for acc in current_accounts if acc.get('active', True)]
+            
+            if len(active_accounts) <= 1:
+                self.logger.warning("twscrape: Only one active account available, cannot rotate")
+                return
+            
+            # アカウントプールの統計を取得
+            pool_stats = await self.api.pool.stats()
+            self.logger.debug(f"twscrape: Current pool stats: {pool_stats}")
+            
+            # 失敗したアカウントを明示的にマークして次のアカウントを使用させる
+            try:
+                # 現在使用中のアカウントを一時的に無効化
+                current_account = getattr(self.api.pool, '_current_account', None)
+                if current_account:
+                    # 短時間のクールダウンを設定
+                    current_account.unlock_at = time.time() + 60  # 1分間のクールダウン
+                    self.logger.info(f"twscrape: Set 1-minute cooldown for current account")
+            except Exception as cooldown_error:
+                self.logger.debug(f"twscrape: Could not set account cooldown: {cooldown_error}")
+            
+            # 利用可能なアカウントの再確認を強制
+            await self.api.pool.refresh()
+            
+            self.logger.info(f"twscrape: Account rotation completed, {len(active_accounts)} accounts available")
+            
+        except Exception as e:
+            self.logger.error(f"twscrape: Error during account rotation: {e}")
+            # 代替手段：失敗したアカウントの再ログインを試行
+            try:
+                await self.api.pool.relogin_failed()
+                self.logger.info("twscrape: Attempted relogin for failed accounts")
+            except Exception as e2:
+                self.logger.warning(f"twscrape: Could not relogin failed accounts: {e2}")
+                # エラーを再発生させずに続行
+
     async def cleanup(self):
         """リソースのクリーンアップ"""
         try:
