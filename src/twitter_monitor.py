@@ -456,79 +456,79 @@ class TwitterMonitor:
                     # 次のツイートを取得
                     tweet = await tweet_iterator.__anext__()
                     
-                total_fetched += 1
-                self.logger.debug(f"twscrape: Tweet {total_fetched}: ID={tweet.id}, Date={tweet.date}")
-                
-                # Tweet IDベースの早期終了
-                if not force_full_fetch and latest_tweet_id and int(tweet.id) <= int(latest_tweet_id):
-                    self.logger.debug(f"twscrape: Reached known tweet {tweet.id}, stopping")
-                    break
-                
-                # 日付チェック
-                if tweet.date < since_date:
-                    old_tweets_count += 1
-                    consecutive_old_tweets += 1
-                    self.logger.debug(f"twscrape: Skipping old tweet: {tweet.id}")
+                    total_fetched += 1
+                    self.logger.debug(f"twscrape: Tweet {total_fetched}: ID={tweet.id}, Date={tweet.date}")
                     
-                    if not force_full_fetch and consecutive_old_tweets >= max_consecutive_old:
-                        self.logger.debug(f"twscrape: Reached {max_consecutive_old} consecutive old tweets, stopping")
+                    # Tweet IDベースの早期終了
+                    if not force_full_fetch and latest_tweet_id and int(tweet.id) <= int(latest_tweet_id):
+                        self.logger.debug(f"twscrape: Reached known tweet {tweet.id}, stopping")
                         break
-                    continue
-                else:
-                    consecutive_old_tweets = 0
-                
-                # リツイートをスキップ
-                if self._is_retweet(tweet, username):
-                    self.logger.debug(f"twscrape: Skipping retweet: {tweet.id}")
-                    continue
-                
-                # 既存ツイートとの重複チェック
-                tweet_id_str = str(tweet.id)
-                if tweet_id_str in existing_tweet_ids or tweet_id_str in collected_tweet_ids:
-                    self.logger.debug(f"twscrape: Skipping duplicate tweet: {tweet.id}")
-                    continue
-                
-                # ツイートデータを抽出
-                tweet_data = {
-                    'id': str(tweet.id),
-                    'text': tweet.rawContent,
-                    'date': tweet.date.isoformat(),
-                    'url': f"https://twitter.com/{username}/status/{tweet.id}",
-                    'username': username,
-                    'media': [],
-                    'videos': []
-                }
-                
-                # メディア（画像）URLを抽出
-                if hasattr(tweet, 'media') and hasattr(tweet.media, 'photos'):
-                    tweet_data['media'] = [photo.url for photo in tweet.media.photos]
-                
-                # 動画URLを抽出
-                if hasattr(tweet, 'media') and hasattr(tweet.media, 'videos'):
-                    for video in tweet.media.videos:
-                        best_variant = None
-                        best_bitrate = 0
-                        
-                        if hasattr(video, 'variants'):
-                            for variant in video.variants:
-                                if hasattr(variant, 'bitrate') and variant.bitrate:
-                                    if variant.bitrate > best_bitrate:
-                                        best_bitrate = variant.bitrate
-                                        best_variant = variant
-                        
-                        if best_variant and hasattr(best_variant, 'url'):
-                            tweet_data['videos'].append(best_variant.url)
-                        elif hasattr(video, 'url'):
-                            tweet_data['videos'].append(video.url)
-                
-                tweets.append(tweet_data)
-                tweet_count += 1
-                
-                if tweet_count % 100 == 0:
-                    self.logger.debug(f"twscrape: Fetched {tweet_count} tweets so far...")
                     
-                # HTTPリトライカウントをリセット（成功した場合）
-                http_retry_count = 0
+                    # 日付チェック
+                    if tweet.date < since_date:
+                        old_tweets_count += 1
+                        consecutive_old_tweets += 1
+                        self.logger.debug(f"twscrape: Skipping old tweet: {tweet.id}")
+                        
+                        if not force_full_fetch and consecutive_old_tweets >= max_consecutive_old:
+                            self.logger.debug(f"twscrape: Reached {max_consecutive_old} consecutive old tweets, stopping")
+                            break
+                        continue
+                    else:
+                        consecutive_old_tweets = 0
+                    
+                    # リツイートをスキップ
+                    if self._is_retweet(tweet, username):
+                        self.logger.debug(f"twscrape: Skipping retweet: {tweet.id}")
+                        continue
+                    
+                    # 既存ツイートとの重複チェック
+                    tweet_id_str = str(tweet.id)
+                    if tweet_id_str in existing_tweet_ids or tweet_id_str in collected_tweet_ids:
+                        self.logger.debug(f"twscrape: Skipping duplicate tweet: {tweet.id}")
+                        continue
+                    
+                    # ツイートデータを抽出
+                    tweet_data = {
+                        'id': str(tweet.id),
+                        'text': tweet.rawContent,
+                        'date': tweet.date.isoformat(),
+                        'url': f"https://twitter.com/{username}/status/{tweet.id}",
+                        'username': username,
+                        'media': [],
+                        'videos': []
+                    }
+                    
+                    # メディア（画像）URLを抽出
+                    if hasattr(tweet, 'media') and hasattr(tweet.media, 'photos'):
+                        tweet_data['media'] = [photo.url for photo in tweet.media.photos]
+                    
+                    # 動画URLを抽出
+                    if hasattr(tweet, 'media') and hasattr(tweet.media, 'videos'):
+                        for video in tweet.media.videos:
+                            best_variant = None
+                            best_bitrate = 0
+                            
+                            if hasattr(video, 'variants'):
+                                for variant in video.variants:
+                                    if hasattr(variant, 'bitrate') and variant.bitrate:
+                                        if variant.bitrate > best_bitrate:
+                                            best_bitrate = variant.bitrate
+                                            best_variant = variant
+                            
+                            if best_variant and hasattr(best_variant, 'url'):
+                                tweet_data['videos'].append(best_variant.url)
+                            elif hasattr(video, 'url'):
+                                tweet_data['videos'].append(video.url)
+                    
+                    tweets.append(tweet_data)
+                    tweet_count += 1
+                    
+                    if tweet_count % 100 == 0:
+                        self.logger.debug(f"twscrape: Fetched {tweet_count} tweets so far...")
+                        
+                    # HTTPリトライカウントをリセット（成功した場合）
+                    http_retry_count = 0
                     
                 except StopAsyncIteration:
                     # イテレータが終了（全ツイート取得完了）
