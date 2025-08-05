@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 import re
 from pathlib import Path
+import time
 
 from twscrape import API, Tweet
 from dotenv import load_dotenv
@@ -49,6 +50,7 @@ class TwitterMonitor:
         self._accounts_initialized = False
         self._session = None
         self.db_manager = db_manager
+        self._timeout_seconds = 300  # 5分のタイムアウト
         
         # gallery-dl extractorを初期化
         from .gallery_dl_extractor import GalleryDLExtractor
@@ -253,6 +255,48 @@ class TwitterMonitor:
             latest_date_override: 効率化のため外部から指定された最新日時
             latest_id_override: 効率化のため外部から指定された最新ID
         """
+        # リトライ設定
+        max_retries = 3
+        retry_count = 0
+        all_collected_tweets = []  # 全リトライで収集したツイート
+        
+        while retry_count < max_retries:
+            try:
+                tweets = await self._get_user_tweets_twscrape_internal(
+                    username, days_lookback, force_full_fetch, 
+                    latest_date_override, latest_id_override,
+                    collected_tweets=all_collected_tweets
+                )
+                # 成功した場合はリトライを終了
+                return tweets
+                
+            except TimeoutError as e:
+                retry_count += 1
+                if retry_count < max_retries:
+                    self.logger.warning(f"twscrape: Timeout for @{username}, retry {retry_count}/{max_retries}")
+                    # リトライ前に少し待機
+                    await asyncio.sleep(5)
+                else:
+                    self.logger.error(f"twscrape: Max retries reached for @{username}")
+                    # 最大リトライ数に達した場合、収集済みツイートを返す
+                    if all_collected_tweets:
+                        self.logger.info(f"twscrape: Returning {len(all_collected_tweets)} partially collected tweets for @{username}")
+                        return self._process_collected_tweets(all_collected_tweets)
+                    raise e
+                    
+            except Exception as e:
+                self.logger.error(f"twscrape: Unexpected error for @{username}: {e}")
+                if all_collected_tweets:
+                    self.logger.info(f"twscrape: Returning {len(all_collected_tweets)} partially collected tweets for @{username}")
+                    return self._process_collected_tweets(all_collected_tweets)
+                raise e
+                
+        return []  # 全て失敗した場合
+    
+    async def _get_user_tweets_twscrape_internal(self, username: str, days_lookback: int = 365, force_full_fetch: bool = False, latest_date_override=None, latest_id_override=None, collected_tweets=None) -> List[Dict[str, Any]]:
+        """
+        twscrapeの内部実装（タイムアウトエラーを投げる）
+        """
         # 既存のget_user_tweetsロジックを流用し、DB取得部分のみoverride値を使用
         await self._initialize_accounts()
         
@@ -291,6 +335,11 @@ class TwitterMonitor:
         else:
             self.logger.info(f"twscrape: Force full fetch enabled for @{username}, fetching ALL tweets since {since_date.strftime('%Y-%m-%d')} with duplicate checking")
         
+        # 既に収集されたツイートIDを追跡
+        if collected_tweets is None:
+            collected_tweets = []
+        collected_tweet_ids = {tweet['id'] for tweet in collected_tweets}
+        
         try:
             # First, resolve username to user ID
             user = await self.api.user_by_login(username)
@@ -320,7 +369,12 @@ class TwitterMonitor:
                 
                 # 最初の数件だけチェック
                 check_limit = 5
+                start_time = time.time()
                 async for tweet in self.api.user_tweets(user.id):
+                    # タイムアウトチェック
+                    if time.time() - start_time > self._timeout_seconds:
+                        self.logger.error(f"twscrape: Timeout after {self._timeout_seconds}s while checking new tweets for @{username}")
+                        raise TimeoutError(f"Timeout while checking new tweets for @{username}")
                     total_fetched += 1
                     self.logger.debug(f"twscrape: Quick check tweet {total_fetched}: ID={tweet.id}, Date={tweet.date}")
                     
@@ -345,7 +399,15 @@ class TwitterMonitor:
                 # 新着がある場合は最初から取得し直す
                 total_fetched = 0
             
+            start_time = time.time()
             async for tweet in self.api.user_tweets(user.id):
+                # タイムアウトチェック
+                if time.time() - start_time > self._timeout_seconds:
+                    self.logger.error(f"twscrape: Timeout after {self._timeout_seconds}s while fetching tweets for @{username}")
+                    # 収集済みツイートをcollected_tweetsに追加
+                    collected_tweets.extend(tweets)
+                    raise TimeoutError(f"Timeout while fetching tweets for @{username}")
+                    
                 total_fetched += 1
                 self.logger.debug(f"twscrape: Tweet {total_fetched}: ID={tweet.id}, Date={tweet.date}")
                 
@@ -374,7 +436,7 @@ class TwitterMonitor:
                 
                 # 既存ツイートとの重複チェック
                 tweet_id_str = str(tweet.id)
-                if tweet_id_str in existing_tweet_ids:
+                if tweet_id_str in existing_tweet_ids or tweet_id_str in collected_tweet_ids:
                     self.logger.debug(f"twscrape: Skipping duplicate tweet: {tweet.id}")
                     continue
                 
@@ -434,7 +496,22 @@ class TwitterMonitor:
             
         except Exception as e:
             self.logger.error(f"twscrape: Error fetching tweets for @{username}: {e}")
+            # タイムアウトエラーは再スロー
+            if isinstance(e, TimeoutError):
+                raise e
             return []
+    
+    def _process_collected_tweets(self, collected_tweets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """収集済みツイートの重複除去と処理"""
+        unique_tweets = []
+        seen_ids = set()
+        for tweet in collected_tweets:
+            if tweet['id'] not in seen_ids:
+                unique_tweets.append(tweet)
+                seen_ids.add(tweet['id'])
+        
+        self.logger.info(f"Processing {len(unique_tweets)} unique tweets from {len(collected_tweets)} collected tweets")
+        return unique_tweets
     
     async def get_user_tweets(self, username: str, days_lookback: int = 365, force_full_fetch: bool = False) -> List[Dict[str, Any]]:
         """指定ユーザーのツイートを取得（リツイート除く）"""
@@ -524,7 +601,13 @@ class TwitterMonitor:
             # force_full_fetchの場合、アカウントプールの状態を定期的に確認
             check_interval = 500  # 500ツイートごとにチェック
             
+            start_time = time.time()
             async for tweet in self.api.user_tweets(user.id):
+                # タイムアウトチェック
+                if time.time() - start_time > self._timeout_seconds:
+                    self.logger.error(f"Timeout after {self._timeout_seconds}s while fetching tweets for @{username}")
+                    break
+                    
                 total_fetched += 1
                 self.logger.debug(f"Tweet {total_fetched}: ID={tweet.id}, Date={tweet.date}, Username={getattr(tweet.user, 'username', 'N/A')}")
                 
