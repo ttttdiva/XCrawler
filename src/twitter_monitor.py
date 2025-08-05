@@ -41,6 +41,46 @@ import twscrape.api as twscrape_api
 twscrape.models.parse_tweets = parse_tweets_unlimited
 twscrape_api.parse_tweets = parse_tweets_unlimited
 
+# twscrapeのAsyncClientにタイムアウトを設定するパッチ
+import twscrape.account
+from httpx import AsyncClient, AsyncHTTPTransport
+
+original_make_client = twscrape.account.Account.make_client
+
+def make_client_with_timeout(self, proxy: str | None = None) -> AsyncClient:
+    """タイムアウトを設定したAsyncClientを作成"""
+    proxies = [proxy, os.getenv("TWS_PROXY"), self.proxy]
+    proxies = [x for x in proxies if x is not None]
+    proxy = proxies[0] if proxies else None
+    
+    # タイムアウトを設定（30秒）
+    transport = AsyncHTTPTransport(retries=2)
+    client = AsyncClient(
+        proxy=proxy, 
+        follow_redirects=True, 
+        transport=transport,
+        timeout=httpx.Timeout(30.0, connect=10.0)  # 30秒のread timeout、10秒のconnect timeout
+    )
+    
+    # saved from previous usage
+    client.cookies.update(self.cookies)
+    client.headers.update(self.headers)
+    
+    # default settings
+    client.headers["user-agent"] = self.user_agent
+    client.headers["content-type"] = "application/json"
+    client.headers["authorization"] = twscrape.account.TOKEN
+    client.headers["x-twitter-active-user"] = "yes"
+    client.headers["x-twitter-client-language"] = "en"
+    
+    if "ct0" in client.cookies:
+        client.headers["x-csrf-token"] = client.cookies["ct0"]
+    
+    return client
+
+# モンキーパッチを適用
+twscrape.account.Account.make_client = make_client_with_timeout
+
 
 class TwitterMonitor:
     def __init__(self, config: dict, db_manager=None, event_detector=None):
@@ -400,13 +440,21 @@ class TwitterMonitor:
                 total_fetched = 0
             
             start_time = time.time()
-            async for tweet in self.api.user_tweets(user.id):
-                # タイムアウトチェック
-                if time.time() - start_time > self._timeout_seconds:
-                    self.logger.error(f"twscrape: Timeout after {self._timeout_seconds}s while fetching tweets for @{username}")
-                    # 収集済みツイートをcollected_tweetsに追加
-                    collected_tweets.extend(tweets)
-                    raise TimeoutError(f"Timeout while fetching tweets for @{username}")
+            http_retry_count = 0
+            max_http_retries = 3
+            tweet_iterator = self.api.user_tweets(user.id).__aiter__()
+            
+            while True:
+                try:
+                    # タイムアウトチェック
+                    if time.time() - start_time > self._timeout_seconds:
+                        self.logger.error(f"twscrape: Timeout after {self._timeout_seconds}s while fetching tweets for @{username}")
+                        # 収集済みツイートをcollected_tweetsに追加
+                        collected_tweets.extend(tweets)
+                        raise TimeoutError(f"Timeout while fetching tweets for @{username}")
+                    
+                    # 次のツイートを取得
+                    tweet = await tweet_iterator.__anext__()
                     
                 total_fetched += 1
                 self.logger.debug(f"twscrape: Tweet {total_fetched}: ID={tweet.id}, Date={tweet.date}")
@@ -478,6 +526,51 @@ class TwitterMonitor:
                 
                 if tweet_count % 100 == 0:
                     self.logger.debug(f"twscrape: Fetched {tweet_count} tweets so far...")
+                    
+                # HTTPリトライカウントをリセット（成功した場合）
+                http_retry_count = 0
+                    
+                except StopAsyncIteration:
+                    # イテレータが終了（全ツイート取得完了）
+                    self.logger.debug(f"twscrape: Reached end of tweets for @{username}")
+                    break
+                    
+                except (httpx.ReadTimeout, httpx.ConnectTimeout) as e:
+                    http_retry_count += 1
+                    if http_retry_count >= max_http_retries:
+                        self.logger.error(f"twscrape: Max HTTP retries ({max_http_retries}) reached for @{username}: {e}")
+                        # 収集済みツイートを保存してから終了
+                        collected_tweets.extend(tweets)
+                        raise TimeoutError(f"HTTP timeout after {max_http_retries} retries for @{username}")
+                    else:
+                        self.logger.warning(f"twscrape: HTTP timeout for @{username}, retry {http_retry_count}/{max_http_retries}: {e}")
+                        # 少し待機してからリトライ
+                        await asyncio.sleep(2 ** http_retry_count)  # 指数バックオフ: 2秒, 4秒, 8秒
+                        # 新しいイテレータを作成して続行
+                        try:
+                            tweet_iterator = self.api.user_tweets(user.id).__aiter__()
+                            # 既に取得したツイートまでスキップ
+                            if tweets:
+                                last_tweet_id = int(tweets[-1]['id'])
+                                self.logger.info(f"twscrape: Resuming from tweet ID {last_tweet_id}")
+                                skip_count = 0
+                                async for skip_tweet in self.api.user_tweets(user.id):
+                                    skip_count += 1
+                                    if int(skip_tweet.id) <= last_tweet_id:
+                                        self.logger.debug(f"twscrape: Skipped {skip_count} tweets to resume")
+                                        break
+                                tweet_iterator = self.api.user_tweets(user.id).__aiter__()
+                        except Exception as e2:
+                            self.logger.error(f"twscrape: Failed to create new iterator: {e2}")
+                            collected_tweets.extend(tweets)
+                            raise
+                        continue
+                        
+                except Exception as e:
+                    # その他の予期しないエラー
+                    self.logger.error(f"twscrape: Unexpected error while fetching tweets: {e}")
+                    collected_tweets.extend(tweets)
+                    raise
             
             # 重複を除去
             unique_tweets = []
