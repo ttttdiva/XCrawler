@@ -169,6 +169,23 @@ class TwitterMonitor:
             
             # すべてのアカウントでログイン
             await self.api.pool.login_all()
+            
+            # ログイン後、実際に利用可能なアカウントがあるか確認
+            try:
+                pool_stats = await self.api.pool.stats()
+                self.logger.info(f"Initial pool stats: {pool_stats}")
+                
+                # 各アカウントの状態を確認（簡易的なテスト）
+                accounts_info = await self.api.pool.accounts_info()
+                active_count = sum(1 for acc in accounts_info if acc.get('active', False))
+                available_count = sum(1 for acc in accounts_info 
+                                     if acc.get('active', False) 
+                                     and acc.get('locks', {}).get('UserTweets', 0) < time.time())
+                self.logger.info(f"Active accounts: {active_count}/{len(accounts_info)}, Available for UserTweets: {available_count}")
+                
+            except Exception as e:
+                self.logger.warning(f"Could not verify account status: {e}")
+            
             self._accounts_initialized = True
             self.logger.info(f"Initialized {total_accounts} Twitter account(s)")
             
@@ -376,6 +393,28 @@ class TwitterMonitor:
         # collected_tweets処理を削除（簡素化）
         
         try:
+            # アカウント利用可能性をチェック（簡易版）
+            try:
+                pool_stats = await self.api.pool.stats()
+                self.logger.debug(f"twscrape: Account pool stats: {pool_stats}")
+                
+                # アクティブなアカウントが1つもない場合のみ早期リターン
+                accounts_info = await self.api.pool.accounts_info()
+                active_accounts = [acc for acc in accounts_info if acc.get('active', False)]
+                if not active_accounts:
+                    self.logger.error(f"twscrape: No active accounts found. All {len(accounts_info)} accounts are invalid.")
+                    return []
+                
+                # 利用可能なアカウント数を確認（情報のみ）
+                available_now = [acc for acc in active_accounts if acc.get('locks', {}).get('UserTweets', 0) < time.time()]
+                if not available_now:
+                    self.logger.info(f"twscrape: All {len(active_accounts)} active accounts are rate-limited. Will wait for next available slot.")
+                else:
+                    self.logger.debug(f"twscrape: {len(available_now)}/{len(active_accounts)} accounts available now")
+                    
+            except Exception as e:
+                self.logger.warning(f"twscrape: Could not check pool stats: {e}")
+            
             # First, resolve username to user ID
             user = await self.api.user_by_login(username)
             if not user:
@@ -602,7 +641,15 @@ class TwitterMonitor:
             return unique_tweets
             
         except Exception as e:
-            self.logger.error(f"twscrape: Error fetching tweets for @{username}: {e}")
+            if "No account available" in str(e):
+                self.logger.warning(f"twscrape: Rate limit reached for @{username}: {e}")
+                # 次の利用可能時間を抽出してログ出力
+                next_available_match = re.search(r'Next available at (\d{2}:\d{2}:\d{2})', str(e))
+                if next_available_match:
+                    next_time = next_available_match.group(1)
+                    self.logger.info(f"twscrape: Next available time: {next_time}")
+            else:
+                self.logger.error(f"twscrape: Error fetching tweets for @{username}: {e}")
             # タイムアウトエラーは再スロー
             if isinstance(e, TimeoutError):
                 raise e
@@ -645,6 +692,28 @@ class TwitterMonitor:
             self.logger.info(f"Force full fetch enabled for @{username}, fetching ALL tweets since {since_date.strftime('%Y-%m-%d')} with duplicate checking")
         
         try:
+            # アカウント利用可能性をチェック（簡易版）
+            try:
+                pool_stats = await self.api.pool.stats()
+                self.logger.debug(f"Account pool stats: {pool_stats}")
+                
+                # アクティブなアカウントが1つもない場合のみ早期リターン
+                accounts_info = await self.api.pool.accounts_info()
+                active_accounts = [acc for acc in accounts_info if acc.get('active', False)]
+                if not active_accounts:
+                    self.logger.error(f"No active accounts found. All {len(accounts_info)} accounts are invalid.")
+                    return []
+                
+                # 利用可能なアカウント数を確認（情報のみ）
+                available_now = [acc for acc in active_accounts if acc.get('locks', {}).get('UserTweets', 0) < time.time()]
+                if not available_now:
+                    self.logger.info(f"All {len(active_accounts)} active accounts are rate-limited. Will wait for next available slot.")
+                else:
+                    self.logger.debug(f"{len(available_now)}/{len(active_accounts)} accounts available now")
+                    
+            except Exception as e:
+                self.logger.warning(f"Could not check pool stats: {e}")
+            
             # First, resolve username to user ID
             user = await self.api.user_by_login(username)
             if not user:
