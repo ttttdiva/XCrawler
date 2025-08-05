@@ -277,12 +277,15 @@ class TwitterMonitor:
             latest_tweet_date = db_manager.get_latest_tweet_date(username)
             latest_tweet_id = db_manager.get_latest_tweet_id(username)
         
+        # force_full_fetchがfalseで既存データがある場合、最初の1件だけチェック
+        check_for_new_tweets_only = not force_full_fetch and latest_tweet_id is not None
+        
         if not force_full_fetch and latest_tweet_date:
             # 最新ツイート日付以降のみ取得（効率化）
             since_date = latest_tweet_date
             self.logger.info(f"twscrape: Found existing tweets for @{username}, fetching since {since_date.strftime('%Y-%m-%d %H:%M:%S')}")
             if latest_tweet_id:
-                self.logger.debug(f"twscrape: Latest tweet ID: {latest_tweet_id}")
+                self.logger.debug(f"twscrape: Latest tweet ID: {latest_tweet_id}, will check for new tweets only")
         elif not force_full_fetch:
             self.logger.info(f"twscrape: No existing tweets for @{username}, fetching since {since_date.strftime('%Y-%m-%d')}")
         else:
@@ -309,6 +312,38 @@ class TwitterMonitor:
             if latest_tweet_date and not force_full_fetch:
                 kv = {"since_time": latest_tweet_date.isoformat()}
                 self.logger.debug(f"twscrape: Using kv parameter: {kv}")
+            
+            # 新着チェックモードの場合
+            if check_for_new_tweets_only:
+                self.logger.info(f"twscrape: Checking for new tweets only (quick check mode)")
+                has_new_tweets = False
+                
+                # 最初の数件だけチェック
+                check_limit = 5
+                async for tweet in self.api.user_tweets(user.id):
+                    total_fetched += 1
+                    self.logger.debug(f"twscrape: Quick check tweet {total_fetched}: ID={tweet.id}, Date={tweet.date}")
+                    
+                    # 既知のツイートに到達したら新着なし
+                    if int(tweet.id) <= int(latest_tweet_id):
+                        self.logger.info(f"twscrape: No new tweets found for @{username} (reached known tweet {tweet.id})")
+                        return []
+                    
+                    # 新着ツイートがあることを確認
+                    has_new_tweets = True
+                    
+                    # チェック上限に達したら通常モードで再取得
+                    if total_fetched >= check_limit:
+                        self.logger.info(f"twscrape: New tweets detected for @{username}, switching to normal fetch mode")
+                        break
+                
+                # 新着がない場合は早期終了
+                if not has_new_tweets:
+                    self.logger.info(f"twscrape: No new tweets found for @{username}")
+                    return []
+                
+                # 新着がある場合は最初から取得し直す
+                total_fetched = 0
             
             async for tweet in self.api.user_tweets(user.id):
                 total_fetched += 1

@@ -334,3 +334,58 @@ EventMonitorでは、取得したツイートをLLM（GPT-4/Gemini）でイベ�
 - **LLM判定ロジックは1箇所に集約**: メンテナンス性を確保
 
 この設計により、同じツイートが複数回LLM判定されることを防ぎつつ、異なるソースから取得したツイートを適切に処理できます。
+
+## twscrapeの効率化機能（2025-08-05追記）
+
+### 新着チェック機能の概要
+twscrapeのAPI呼び出しを削減するため、`force_full_fetch: false`の場合に新着チェックモードが動作します。
+
+### 動作条件
+- **効率化モード（新着チェック）**: `force_full_fetch: false` かつ 既存ツイートがDBに存在
+- **全件取得モード**: `force_full_fetch: true` または 既存ツイートがDBに存在しない
+
+### 新着チェック処理の詳細
+
+1. **クイックチェック段階**
+   ```
+   条件: force_full_fetch=false かつ 既存ツイートあり
+   処理:
+   ├─ 最新5件のツイートのみを取得
+   ├─ 各ツイートIDをDBの最新IDと比較
+   ├─ 既知のIDに到達 → 新着なし（空配列を返す）
+   └─ 5件すべて新しい → 新着あり（通常取得へ）
+   ```
+
+2. **通常取得段階**
+   ```
+   新着ありの場合:
+   ├─ 最初から再度ツイートを取得
+   ├─ 既知のツイートIDに到達するまで継続
+   └─ 新規ツイートのみを返す
+   ```
+
+### 実装コード
+`src/twitter_monitor.py`の`_get_user_tweets_twscrape_only`メソッド（248-402行目）
+
+主要部分：
+```python
+# 効率化モードの判定（281行目）
+check_for_new_tweets_only = not force_full_fetch and latest_tweet_id is not None
+
+# クイックチェック（317-346行目）
+if check_for_new_tweets_only:
+    # 最初の5件だけチェック
+    for tweet in api.user_tweets(user.id):
+        if int(tweet.id) <= int(latest_tweet_id):
+            # 新着なし
+            return []
+```
+
+### パフォーマンス効果
+- **新着なしの場合**: 5回のAPI呼び出しのみ（従来: 数百〜数千回）
+- **新着ありの場合**: 新着分 + αのAPI呼び出し
+
+### 注意事項
+- gallery-dlは常に全件取得（効率化対象外）
+- 初回実行時は自動的に全件取得モード
+- twscrapeは補完的な役割のため、この効率化が特に重要
