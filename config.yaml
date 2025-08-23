@@ -29,23 +29,25 @@ tweet_settings:
   # リトライ設定
   max_retries: 3
   retry_delay: 60  # 秒
-  # 強制的に全ツイートを取得するか（効率化を無視）
-  force_full_fetch: false
   
   # gallery-dl設定（メディア付きツイートの取得と画像・動画ダウンロード）
   gallery_dl:
     # gallery-dlを使用するか（優先実行される）
     enabled: true
+    # 強制的に全ツイートを取得するか（新着チェックをスキップ）
+    force_full_fetch: false
   
   # twscrape設定（テキストのみツイート取得）
   twscrape:
     # twscrapeを使用するか（gallery-dlで取得できなかったツイートを補完）
     enabled: true
+    # 強制的に全ツイートを取得するか（効率化を無視）
+    force_full_fetch: false
 
 # イベント判定設定
 event_detection:
   # イベント検出機能を有効にするか（false: クローラーとしてのみ動作）
-  enabled: false
+  enabled: true
   # イベント関連キーワード
   keywords:
     - "参加"
@@ -104,7 +106,7 @@ huggingface_backup:
 # Hydrus Client連携設定
 hydrus:
   # 連携を有効にするか
-  enabled: false
+  enabled: true
   # Hydrus Client APIのURL
   api_url: "http://127.0.0.1:45869"
   # インポート設定

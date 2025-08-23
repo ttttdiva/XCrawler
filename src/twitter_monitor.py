@@ -225,6 +225,61 @@ class TwitterMonitor:
         """gallery-dlが全メディアを処理するため、この関数は不要"""
         return []
     
+    async def check_for_new_tweets(self, username: str, latest_tweet_id: str = None) -> bool:
+        """
+        新着ツイートがあるか簡易チェック（独立した機能）
+        
+        Args:
+            username: Twitter username
+            latest_tweet_id: DBに保存されている最新ツイートID
+            
+        Returns:
+            新着ツイートがある場合True、ない場合False
+        """
+        if not latest_tweet_id:
+            # 既存ツイートがない場合は新着ありとして扱う
+            self.logger.debug(f"No existing tweets for @{username}, treating as new")
+            return True
+        
+        await self._initialize_accounts()
+        
+        try:
+            # ユーザー情報を取得
+            user = await self.api.user_by_login(username)
+            if not user:
+                self.logger.error(f"Quick check: User @{username} not found")
+                return False
+            
+            self.logger.info(f"Quick check: Checking for new tweets for @{username} (latest ID: {latest_tweet_id})")
+            
+            # 最新の1件だけチェック
+            start_time = time.time()
+            async for tweet in self.api.user_tweets(user.id):
+                # タイムアウトチェック（10秒）
+                if time.time() - start_time > 10:
+                    self.logger.warning(f"Quick check timeout for @{username}, assuming new tweets exist")
+                    return True
+                
+                self.logger.debug(f"Quick check: Latest tweet ID={tweet.id}")
+                
+                # 既知のツイートに到達したら新着なし
+                if int(tweet.id) <= int(latest_tweet_id):
+                    self.logger.info(f"Quick check: No new tweets for @{username}")
+                    return False
+                
+                # 新着ツイートあり
+                self.logger.info(f"Quick check: New tweets detected for @{username} (new ID: {tweet.id})")
+                return True
+            
+            # ツイートが1件も取得できなかった場合
+            self.logger.warning(f"Quick check: No tweets fetched for @{username}, assuming no new tweets")
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"Quick check failed for @{username}: {e}")
+            # エラーの場合は安全のため新着ありとして扱う
+            return True
+    
     async def get_user_tweets_with_gallery_dl_first(self, username: str, days_lookback: int = 365, force_full_fetch: bool = False, event_detection_enabled: bool = True) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         gallery-dl優先でツイートを取得
@@ -242,8 +297,13 @@ class TwitterMonitor:
         all_event_tweets = []
         
         # Gallery-dlの有効性をチェック
-        gallery_dl_enabled = self.config.get('tweet_settings', {}).get('gallery_dl', {}).get('enabled', True)
-        twscrape_enabled = self.config.get('tweet_settings', {}).get('twscrape', {}).get('enabled', True)
+        gallery_dl_config = self.config.get('tweet_settings', {}).get('gallery_dl', {})
+        gallery_dl_enabled = gallery_dl_config.get('enabled', True)
+        gallery_dl_force_full = gallery_dl_config.get('force_full_fetch', False)
+        
+        twscrape_config = self.config.get('tweet_settings', {}).get('twscrape', {})
+        twscrape_enabled = twscrape_config.get('enabled', True)
+        twscrape_force_full = twscrape_config.get('force_full_fetch', False)
         
         # DB から今回のクロール実行前の最新ツイート日時を記録（twscrape用）
         pre_crawl_latest_date = None
@@ -254,20 +314,30 @@ class TwitterMonitor:
         
         # 1. Gallery-dlでメディア付きツイートを優先取得
         if gallery_dl_enabled:
-            self.logger.info(f"Step 1: Fetching media tweets with gallery-dl for @{username}")
-            try:
-                gallery_tweets, gallery_event_tweets = await self.gallery_dl_extractor.fetch_and_analyze_tweets(username, event_detection_enabled=event_detection_enabled)
-                
-                if gallery_tweets:
-                    all_tweets.extend(gallery_tweets)
-                    self.logger.info(f"Gallery-dl retrieved {len(gallery_tweets)} media tweets for @{username}")
+            # gallery-dlのforce_full_fetchがfalseの場合、新着チェックを実行
+            should_fetch_gallery = True
+            if not gallery_dl_force_full and pre_crawl_latest_id:
+                # 新着チェック
+                has_new_tweets = await self.check_for_new_tweets(username, pre_crawl_latest_id)
+                if not has_new_tweets:
+                    self.logger.info(f"Step 1: Skipping gallery-dl for @{username} (no new tweets detected)")
+                    should_fetch_gallery = False
+            
+            if should_fetch_gallery:
+                self.logger.info(f"Step 1: Fetching media tweets with gallery-dl for @{username}")
+                try:
+                    gallery_tweets, gallery_event_tweets = await self.gallery_dl_extractor.fetch_and_analyze_tweets(username, event_detection_enabled=event_detection_enabled)
                     
-                if gallery_event_tweets:
-                    all_event_tweets.extend(gallery_event_tweets)
-                    self.logger.info(f"Gallery-dl found {len(gallery_event_tweets)} event tweets for @{username}")
-                
-            except Exception as e:
-                self.logger.error(f"Gallery-dl failed for @{username}: {e}")
+                    if gallery_tweets:
+                        all_tweets.extend(gallery_tweets)
+                        self.logger.info(f"Gallery-dl retrieved {len(gallery_tweets)} media tweets for @{username}")
+                        
+                    if gallery_event_tweets:
+                        all_event_tweets.extend(gallery_event_tweets)
+                        self.logger.info(f"Gallery-dl found {len(gallery_event_tweets)} event tweets for @{username}")
+                    
+                except Exception as e:
+                    self.logger.error(f"Gallery-dl failed for @{username}: {e}")
         else:
             self.logger.info("Gallery-dl is disabled, skipping media tweet fetching")
         
@@ -279,7 +349,7 @@ class TwitterMonitor:
                 twscrape_tweets = await self._get_user_tweets_twscrape_only(
                     username, 
                     days_lookback, 
-                    force_full_fetch, 
+                    twscrape_force_full,  # twscrape独自のforce_full_fetchを使用
                     latest_date_override=pre_crawl_latest_date,
                     latest_id_override=pre_crawl_latest_id
                 )
@@ -376,8 +446,14 @@ class TwitterMonitor:
             latest_tweet_date = db_manager.get_latest_tweet_date(username)
             latest_tweet_id = db_manager.get_latest_tweet_id(username)
         
-        # force_full_fetchがfalseで既存データがある場合、最初の1件だけチェック
-        check_for_new_tweets_only = not force_full_fetch and latest_tweet_id is not None
+        # force_full_fetchがfalseで既存データがある場合、新着チェックを実行
+        should_fetch_tweets = True
+        if not force_full_fetch and latest_tweet_id is not None:
+            # 独立した新着チェック機能を使用
+            has_new_tweets = await self.check_for_new_tweets(username, latest_tweet_id)
+            if not has_new_tweets:
+                self.logger.info(f"twscrape: Skipping fetch for @{username} (no new tweets detected)")
+                return []  # 新着がない場合は早期リターン
         
         if not force_full_fetch and latest_tweet_date:
             # 最新ツイート日付以降のみ取得（効率化）
@@ -436,42 +512,8 @@ class TwitterMonitor:
                 kv = {"since_time": latest_tweet_date.isoformat()}
                 self.logger.debug(f"twscrape: Using kv parameter: {kv}")
             
-            # 新着チェックモードの場合
-            if check_for_new_tweets_only:
-                self.logger.info(f"twscrape: Checking for new tweets only (quick check mode)")
-                has_new_tweets = False
-                
-                # 最初の数件だけチェック
-                check_limit = 5
-                start_time = time.time()
-                async for tweet in self.api.user_tweets(user.id):
-                    # タイムアウトチェック
-                    if time.time() - start_time > self._timeout_seconds:
-                        self.logger.error(f"twscrape: Timeout after {self._timeout_seconds}s while checking new tweets for @{username}")
-                        raise TimeoutError(f"Timeout while checking new tweets for @{username}")
-                    total_fetched += 1
-                    self.logger.debug(f"twscrape: Quick check tweet {total_fetched}: ID={tweet.id}, Date={tweet.date}")
-                    
-                    # 既知のツイートに到達したら新着なし
-                    if int(tweet.id) <= int(latest_tweet_id):
-                        self.logger.info(f"twscrape: No new tweets found for @{username} (reached known tweet {tweet.id})")
-                        return []
-                    
-                    # 新着ツイートがあることを確認
-                    has_new_tweets = True
-                    
-                    # チェック上限に達したら通常モードで再取得
-                    if total_fetched >= check_limit:
-                        self.logger.info(f"twscrape: New tweets detected for @{username}, switching to normal fetch mode")
-                        break
-                
-                # 新着がない場合は早期終了
-                if not has_new_tweets:
-                    self.logger.info(f"twscrape: No new tweets found for @{username}")
-                    return []
-                
-                # 新着がある場合は最初から取得し直す
-                total_fetched = 0
+            # 新着チェックは既に実施済みなので、ここでは通常取得を実行
+            self.logger.info(f"twscrape: Fetching tweets for @{username} (new tweets confirmed)")
             
             start_time = time.time()
             

@@ -60,11 +60,17 @@ class EventMonitor:
             with open(csv_path, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
+                    # account_typeの値を安全に取得
+                    account_type = row.get('account_type')
+                    if account_type is None:
+                        account_type = ''
+                    account_type = account_type.strip()
+                    
                     accounts.append({
                         'username': row['username'],
                         'display_name': row['display_name'],
                         'event_detection_enabled': row.get('event_detection_enabled', '1') == '1',
-                        'account_type': row.get('account_type', '').strip()  # 空欄がデフォルト（通常監視）
+                        'account_type': account_type  # 空欄がデフォルト（通常監視）
                     })
         except FileNotFoundError:
             raise FileNotFoundError(f"監視対象アカウントのCSVファイルが見つかりません: {csv_path}")
@@ -122,7 +128,7 @@ class EventMonitor:
                     tweets, gallery_event_tweets = await self.twitter_monitor.get_user_tweets_with_gallery_dl_first(
                         username,
                         days_lookback=self.config['tweet_settings']['days_lookback'],
-                        force_full_fetch=self.config['tweet_settings'].get('force_full_fetch', False),
+                        force_full_fetch=self.config['tweet_settings'].get('twscrape', {}).get('force_full_fetch', False),
                         event_detection_enabled=account.get('event_detection_enabled', True)
                     )
                     
@@ -144,7 +150,7 @@ class EventMonitor:
                     
                     # 通常アカウントの処理（簡略化版）
                     # 1. 新規ツイートのフィルタリング
-                    force_full_fetch = self.config['tweet_settings'].get('force_full_fetch', False)
+                    force_full_fetch = self.config['tweet_settings'].get('twscrape', {}).get('force_full_fetch', False)
                     if force_full_fetch:
                         # force_full_fetchの場合は全てのツイートを処理（重複チェックしない）
                         new_tweets = tweets

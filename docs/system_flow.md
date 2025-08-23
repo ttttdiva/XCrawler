@@ -341,12 +341,16 @@ EventMonitorでは、取得したツイートをLLM（GPT-4/Gemini）でイベ�
 EventMonitorは以下の順序で処理を実行します。**この順序は重要です**：
 
 1. **gallery-dl（JSON取得）**
+   - **新着チェック**: `gallery_dl.force_full_fetch: false`の場合、事前に新着チェックを実行
+   - 新着がない場合はJSON取得もスキップ
    - メディア付きツイートのメタデータを取得
    - JSONフォーマットで全ツイート情報を取得
    - この時点ではメディアファイルはダウンロードしない
    - `source: 'gallery-dl'`としてマーク
 
 2. **twscrape（テキストツイート補完）**
+   - **新着チェック**: `twscrape.force_full_fetch: false`の場合、事前に新着チェックを実行
+   - 新着がない場合はツイート取得をスキップ
    - gallery-dlで取得できなかったテキストのみツイートを補完
    - 主にメディアを含まないツイートが対象
    - gallery-dlで取得済みのツイートは重複除外
@@ -383,23 +387,31 @@ EventMonitorは以下の順序で処理を実行します。**この順序は重
 
 ## twscrapeの効率化機能（2025-08-05追記）
 
-### 新着チェック機能の概要
-twscrapeのAPI呼び出しを削減するため、`force_full_fetch: false`の場合に新着チェックモードが動作します。
+### 新着チェック機能の概要（2025-08-23更新）
+API呼び出しを削減するため、新着チェック機能が独立した機能として実装されました。
 
 ### 動作条件
-- **効率化モード（新着チェック）**: `force_full_fetch: false` かつ 既存ツイートがDBに存在
-- **全件取得モード**: `force_full_fetch: true` または 既存ツイートがDBに存在しない
+
+#### gallery-dl
+- **効率化モード**: `gallery_dl.force_full_fetch: false` かつ 既存ツイートがDBに存在
+- **全件取得モード**: `gallery_dl.force_full_fetch: true` または 既存ツイートがDBに存在しない
+
+#### twscrape  
+- **効率化モード**: `twscrape.force_full_fetch: false` かつ 既存ツイートがDBに存在
+- **全件取得モード**: `twscrape.force_full_fetch: true` または 既存ツイートがDBに存在しない
 
 ### 新着チェック処理の詳細
+
+`check_for_new_tweets`メソッドがgallery-dlとtwscrapeの両方から利用されます。
 
 1. **クイックチェック段階**
    ```
    条件: force_full_fetch=false かつ 既存ツイートあり
    処理:
-   ├─ 最新5件のツイートのみを取得
-   ├─ 各ツイートIDをDBの最新IDと比較
-   ├─ 既知のIDに到達 → 新着なし（空配列を返す）
-   └─ 5件すべて新しい → 新着あり（通常取得へ）
+   ├─ 最新の1件のツイートのみを取得
+   ├─ そのツイートIDをDBの最新IDと比較
+   ├─ 既知のID → 新着なし（空配列を返す）
+   └─ 新しいID → 新着あり（通常取得へ）
    ```
 
 2. **通常取得段階**
@@ -418,9 +430,9 @@ twscrapeのAPI呼び出しを削減するため、`force_full_fetch: false`の�
 # 効率化モードの判定（281行目）
 check_for_new_tweets_only = not force_full_fetch and latest_tweet_id is not None
 
-# クイックチェック（317-346行目）
+# クイックチェック
 if check_for_new_tweets_only:
-    # 最初の5件だけチェック
+    # 最新の1件だけチェック
     for tweet in api.user_tweets(user.id):
         if int(tweet.id) <= int(latest_tweet_id):
             # 新着なし
@@ -428,10 +440,21 @@ if check_for_new_tweets_only:
 ```
 
 ### パフォーマンス効果
-- **新着なしの場合**: 5回のAPI呼び出しのみ（従来: 数百〜数千回）
-- **新着ありの場合**: 新着分 + αのAPI呼び出し
+
+#### 従来の方式
+- gallery-dl: 毎回全JSON取得
+- twscrape: 毎回全ツイート取得
+- API呼び出し: 数百〜数千回/ユーザー
+
+#### 改善後（2025-08-23更新）
+- **新着なしの場合**: 
+  - API呼び出し: **1回のみ**（新着チェック）
+  - gallery-dl: JSON取得スキップ
+  - twscrape: ツイート取得スキップ
+- **新着ありの場合**: 
+  - 通常通りの処理を実行
 
 ### 注意事項
-- gallery-dlは常に全件取得（効率化対象外）
-- 初回実行時は自動的に全件取得モード
-- twscrapeは補完的な役割のため、この効率化が特に重要
+- 初回実行時は自動的に全件取得モード（DBに既存データがないため）
+- gallery-dlとtwscrapeは独立して新着チェックを実行
+- 両方に`force_full_fetch: false`を設定することで最大限の効率化
