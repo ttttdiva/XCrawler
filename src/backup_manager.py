@@ -8,7 +8,13 @@ import json
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-from huggingface_hub import HfApi, upload_file, create_repo
+from huggingface_hub import HfApi, upload_file, upload_folder, create_repo
+
+try:
+    from huggingface_hub import upload_large_folder
+    HAS_UPLOAD_LARGE_FOLDER = True
+except ImportError:
+    HAS_UPLOAD_LARGE_FOLDER = False
 import pandas as pd
 import re
 import yaml
@@ -25,6 +31,10 @@ class BackupManager:
         self.logger = logging.getLogger("EventMonitor.Backup")
         self.backup_config = config.get('huggingface_backup', {})
         self.db_manager = db_manager
+        
+        # バッチアップロード用の設定
+        self.upload_mode = self.backup_config.get('upload_mode', 'immediate')
+        self.batch_upload_files = []  # バッチアップロード待ちファイルリスト
         
         # logアカウント用の場合は設定に関わらず初期化を続行
         # （通常のバックアップが無効でもlogアカウントは処理する）
@@ -61,7 +71,6 @@ class BackupManager:
             if self.backup_config.get('rclone_encryption', {}).get('enabled', False):
                 try:
                     rclone_config = RcloneConfig(
-                        remote_name=self.backup_config['rclone_encryption']['remote_name'],
                         config_path=self.backup_config['rclone_encryption'].get('config_path')
                     )
                     self.rclone_client = RcloneClient(rclone_config)
@@ -1430,3 +1439,263 @@ class BackupManager:
             
         except Exception as e:
             self.logger.error(f"Failed to save video encryption mapping: {e}")
+    
+    def should_use_batch_mode(self) -> bool:
+        """バッチモードを使用するか判定"""
+        return self.backup_config.get('enabled', False) and self.upload_mode == 'batch'
+    
+    async def batch_upload_folder(self, folder_path: Path, account_type: str = 'monitoring', 
+                                 encrypt: bool = False, delete_after: bool = False,
+                                 username: str = None):
+        """フォルダ全体を一括アップロード
+        
+        Args:
+            folder_path: アップロード対象フォルダ
+            account_type: 'monitoring' または 'log'
+            encrypt: 暗号化するか（logアカウント用）
+            delete_after: アップロード後に削除するか
+            username: アカウント名（ログ用）
+        """
+        if not self.backup_config.get('enabled', False) and account_type == 'monitoring':
+            return
+        
+        try:
+            self.logger.info(f"Starting batch upload for {folder_path} (type: {account_type})")
+            
+            # リポジトリの存在確認
+            self._ensure_repo_exists()
+            
+            if encrypt and self.rclone_client:
+                # 暗号化が有効かつrclone_clientが初期化されている場合
+                await self._batch_upload_encrypted_folder(folder_path, username, delete_after)
+            else:
+                # 暗号化が無効またはrclone_clientが未初期化の場合
+                await self._batch_upload_plain_folder(folder_path, username, delete_after)
+                
+            self.logger.info(f"Completed batch upload for {folder_path}")
+            
+        except Exception as e:
+            self.logger.error(f"Batch upload failed for {folder_path}: {e}")
+            raise
+    
+    async def _batch_upload_plain_folder(self, folder_path: Path, username: str = None, 
+                                        delete_after: bool = False):
+        """暗号化なしでフォルダを一括アップロード（upload_folder使用）"""
+        if not username:
+            self.logger.error("Username is required for batch upload")
+            return
+            
+        try:
+            # アカウント別のディレクトリを確認
+            account_images_dir = folder_path / 'images' / username
+            account_videos_dir = folder_path / 'videos' / username
+            has_images = account_images_dir.exists()
+            has_videos = account_videos_dir.exists()
+            
+            if not has_images and not has_videos:
+                self.logger.warning(f"No media directories found for account {username}")
+                return
+            
+            # 一時的なアップロード用フォルダを作成
+            import tempfile
+            import shutil
+            with tempfile.TemporaryDirectory(prefix=f"batch_upload_{username}_") as temp_dir:
+                temp_path = Path(temp_dir)
+                
+                # アカウント別のimages/とvideos/を一時フォルダにコピー
+                if has_images:
+                    shutil.copytree(account_images_dir, temp_path / 'images' / username)
+                    self.logger.info(f"Prepared images for {username}")
+                if has_videos:
+                    shutil.copytree(account_videos_dir, temp_path / 'videos' / username)
+                    self.logger.info(f"Prepared videos for {username}")
+                
+                # ファイル数をカウント
+                file_count = sum(1 for _ in temp_path.rglob('*') if _.is_file())
+                self.logger.info(f"Uploading {file_count} files for account {username}")
+                
+                # 大量ファイルの場合はupload_large_folder、少ない場合はupload_folder
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        if file_count > 1000 and HAS_UPLOAD_LARGE_FOLDER:  # 1000ファイル以上かつ関数が利用可能
+                            self.logger.info(f"Using upload_large_folder for {file_count} files")
+                            upload_large_folder(
+                                folder_path=str(temp_path),
+                                repo_id=self.full_repo_name,
+                                repo_type="dataset",
+                                token=self.api.token,
+                                path_in_repo=".",  # リポジトリのルートにアップロード
+                                ignore_patterns=["*.tmp", "*.temp", ".DS_Store", "Thumbs.db"]
+                            )
+                        else:
+                            if file_count > 1000 and not HAS_UPLOAD_LARGE_FOLDER:
+                                self.logger.warning(f"Large file count ({file_count}) detected but upload_large_folder not available. Using upload_folder.")
+                            self.logger.info(f"Using upload_folder for {file_count} files")
+                            upload_folder(
+                                folder_path=str(temp_path),
+                                repo_id=self.full_repo_name,
+                                repo_type="dataset",
+                                token=self.api.token,
+                                path_in_repo=".",  # リポジトリのルートにアップロード
+                                ignore_patterns=["*.tmp", "*.temp", ".DS_Store", "Thumbs.db"]
+                            )
+                        break  # 成功したら終了
+                    except Exception as e:
+                        if self._handle_upload_error(e) and attempt < max_retries - 1:
+                            continue  # リトライ
+                        else:
+                            raise  # エラーを再発生
+                
+                self.logger.info(f"Successfully uploaded media for account {username}")
+            
+            # フォルダ削除（オプション）
+            if delete_after:
+                try:
+                    import shutil
+                    shutil.rmtree(folder_path)
+                    self.logger.info(f"Deleted folder: {folder_path}")
+                except Exception as e:
+                    self.logger.error(f"Failed to delete folder {folder_path}: {e}")
+                    
+        except Exception as e:
+            self.logger.error(f"Batch upload failed: {e}")
+            raise
+    
+    async def _batch_upload_encrypted_folder(self, folder_path: Path, username: str = None,
+                                            delete_after: bool = True):
+        """フォルダを暗号化してアップロード（upload_folder使用）"""
+        if not self.rclone_client:
+            self.logger.error("Rclone encryption not configured for batch upload")
+            return await self._batch_upload_plain_folder(folder_path, username, delete_after)
+        
+        if not username:
+            self.logger.error("Username is required for batch upload")
+            return
+            
+        encrypted_folder = None
+        try:
+            # 暗号化用の一時フォルダを作成
+            encrypted_folder = folder_path.parent / f"{folder_path.name}_encrypted_{username}"
+            encrypted_folder.mkdir(exist_ok=True)
+            
+            file_mappings = {}  # 元ファイル -> 暗号化ファイルのマッピング
+            
+            # アカウント別のimages/とvideos/ディレクトリを処理
+            for media_type in ['images', 'videos']:
+                account_media_dir = folder_path / media_type / username
+                if not account_media_dir.exists():
+                    continue
+                    
+                self.logger.info(f"Encrypting {media_type} for {username}")
+                
+                # 暗号化先ディレクトリを作成
+                encrypted_media_dir = encrypted_folder / f"encrypted_{media_type}" / username
+                encrypted_media_dir.mkdir(parents=True, exist_ok=True)
+                
+                # ファイルパターンを決定
+                if media_type == 'images':
+                    patterns = ['*.jpg', '*.jpeg', '*.png', '*.gif', '*.webp']
+                else:
+                    patterns = ['*.mp4', '*.gif', '*.m3u8', '*.webm', '*.mov', '*.avi']
+                
+                # ファイルを収集
+                files_to_encrypt = []
+                for pattern in patterns:
+                    files_to_encrypt.extend(account_media_dir.glob(pattern))
+                
+                if not files_to_encrypt:
+                    continue
+                
+                self.logger.info(f"Encrypting {len(files_to_encrypt)} {media_type} files for {username}")
+                
+                # バッチ暗号化
+                base_dir = folder_path / media_type  # images/ or videos/
+                encrypted_files = self.rclone_client.encrypt_files_batch(files_to_encrypt, base_dir)
+                
+                # 暗号化ファイルを適切な場所に移動
+                for original_file, temp_encrypted_file in encrypted_files.items():
+                    try:
+                        # 最終的な暗号化ファイルパス
+                        final_encrypted_path = encrypted_media_dir / temp_encrypted_file.name
+                        
+                        # 一時ファイルを移動
+                        import shutil
+                        shutil.move(str(temp_encrypted_file), str(final_encrypted_path))
+                        
+                        # マッピングに記録
+                        file_mappings[str(original_file.relative_to(folder_path))] = final_encrypted_path.name
+                        self.logger.debug(f"Encrypted: {original_file.name} -> {final_encrypted_path.name}")
+                        
+                    except Exception as e:
+                        self.logger.error(f"Failed to process {original_file}: {e}")
+            
+            # マッピングファイルを保存
+            if file_mappings:
+                mapping_file = encrypted_folder / "encryption_mapping.json"
+                with open(mapping_file, 'w', encoding='utf-8') as f:
+                    json.dump(file_mappings, f, ensure_ascii=False, indent=2)
+                self.logger.info(f"Created encryption mapping with {len(file_mappings)} entries")
+            
+            # ファイル数をカウント
+            file_count = sum(1 for _ in encrypted_folder.rglob('*') if _.is_file())
+            
+            # 大量ファイルの場合はupload_large_folder、少ない場合はupload_folder
+            self.logger.info(f"Uploading encrypted folder using upload API ({file_count} files)")
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    if file_count > 1000 and HAS_UPLOAD_LARGE_FOLDER:  # 1000ファイル以上かつ関数が利用可能
+                        self.logger.info(f"Using upload_large_folder for {file_count} files")
+                        upload_large_folder(
+                            folder_path=str(encrypted_folder),
+                            repo_id=self.full_repo_name,
+                            repo_type="dataset",
+                            token=self.api.token,
+                            path_in_repo=f"batch_encrypted/{username}",  # ユーザー名ごとに分離
+                            ignore_patterns=["*.tmp", "*.temp", ".DS_Store", "Thumbs.db"]
+                        )
+                    else:
+                        if file_count > 1000 and not HAS_UPLOAD_LARGE_FOLDER:
+                            self.logger.warning(f"Large file count ({file_count}) detected but upload_large_folder not available. Using upload_folder.")
+                        self.logger.info(f"Using upload_folder for {file_count} files")
+                        upload_folder(
+                            folder_path=str(encrypted_folder),
+                            repo_id=self.full_repo_name,
+                            repo_type="dataset",
+                            token=self.api.token,
+                            path_in_repo=f"batch_encrypted/{username}",  # ユーザー名ごとに分離
+                            ignore_patterns=["*.tmp", "*.temp", ".DS_Store", "Thumbs.db"]
+                        )
+                    break  # 成功したら終了
+                except Exception as e:
+                    if self._handle_upload_error(e) and attempt < max_retries - 1:
+                        continue  # リトライ
+                    else:
+                        raise  # エラーを再発生
+            
+            self.logger.info(f"Successfully uploaded encrypted folder for {username}")
+            
+            # 削除処理
+            if delete_after:
+                # 元フォルダを削除
+                import shutil
+                shutil.rmtree(folder_path)
+                self.logger.info(f"Deleted original folder: {folder_path}")
+            
+            # 暗号化フォルダは常に削除（一時ファイル）
+            if encrypted_folder and encrypted_folder.exists():
+                import shutil
+                shutil.rmtree(encrypted_folder)
+                self.logger.info(f"Deleted encrypted folder: {encrypted_folder}")
+            
+        except Exception as e:
+            self.logger.error(f"Batch encrypted upload failed: {e}")
+            # クリーンアップ
+            if encrypted_folder and encrypted_folder.exists():
+                try:
+                    import shutil
+                    shutil.rmtree(encrypted_folder)
+                except:
+                    pass
+            raise

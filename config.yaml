@@ -91,14 +91,14 @@ huggingface_backup:
   repo_name: "hfusername/XCrawler_1"
   # 画像も含めるか
   include_images: true
+  # アップロードモード ('immediate': 即時アップロード, 'batch': 全ダウンロード後一括アップロード)
+  upload_mode: 'batch'
   # rclone暗号化設定
   rclone_encryption:
     # 暗号化を有効にするか
     enabled: true
-    # rclone設定ファイルのパス
+    # rclone設定ファイルのパス（省略時はデフォルトのrclone.conf）
     config_path: "rclone.conf"
-    # 使用するrcloneリモート名
-    remote_name: "eventmonitor_crypt"
   # レート制限時の待機をスキップするか（falseで適切に待機）
   skip_rate_limit_wait: false
 
@@ -153,3 +153,11 @@ log_only_accounts:
   delete_after_upload: true
   # 一度に処理するツイート数
   batch_size: 50
+  # アップロードモード ('immediate': 即時アップロード, 'batch': 全ダウンロード後一括アップロード)
+  upload_mode: 'batch'
+  # バッチモード用設定
+  batch_mode:
+    # 暗号化を有効にするか（logアカウントのみ）
+    encrypt_before_upload: true
+    # アップロード後にフォルダを削除するか
+    delete_after_batch_upload: false

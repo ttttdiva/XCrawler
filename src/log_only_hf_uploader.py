@@ -42,6 +42,14 @@ class LogOnlyHFUploader:
         self.delete_after_upload = self.log_only_config.get('delete_after_upload', True)
         self.batch_size = self.log_only_config.get('batch_size', 50)
         
+        # アップロードモード設定
+        self.upload_mode = self.log_only_config.get('upload_mode', 'immediate')
+        
+        # バッチモード設定
+        batch_mode_config = self.log_only_config.get('batch_mode', {})
+        self.batch_encrypt = batch_mode_config.get('encrypt_before_upload', True)
+        self.batch_delete_after = batch_mode_config.get('delete_after_batch_upload', False)
+        
         # HfApiの初期化
         try:
             token = os.getenv('HUGGINGFACE_API_KEY')
@@ -80,7 +88,6 @@ class LogOnlyHFUploader:
             if hf_backup_config.get('rclone_encryption', {}).get('enabled', False):
                 try:
                     rclone_config = RcloneConfig(
-                        remote_name=hf_backup_config['rclone_encryption']['remote_name'],
                         config_path=hf_backup_config['rclone_encryption'].get('config_path')
                     )
                     self.rclone_client = RcloneClient(rclone_config)
@@ -659,3 +666,51 @@ Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                     return False
         
         return False
+    
+    async def batch_upload_account_folder(self, username: str, account_type: str = 'log'):
+        """アカウントの全ダウンロード完了後にフォルダを一括アップロード
+        
+        Args:
+            username: Twitterアカウント名
+            account_type: 'log' または 'monitoring'
+        """
+        if not self.enabled:
+            return
+        
+        # バッチモードが無効なら何もしない
+        if self.upload_mode != 'batch':
+            self.logger.debug(f"Batch mode not enabled (current: {self.upload_mode})")
+            return
+        
+        try:
+            # BackupManagerを使用してバッチアップロード
+            if self.backup_manager:
+                # アカウントのデータフォルダを特定
+                base_folder = Path('.')  # プロジェクトルート
+                
+                # 暗号化設定を決定
+                encrypt = (account_type == 'log' and self.batch_encrypt)
+                delete_after = (account_type == 'log' and self.batch_delete_after)
+                
+                self.logger.info(f"Starting batch upload for {username} (type: {account_type}, encrypt: {encrypt})")
+                
+                # BackupManagerにbatch_upload_folderを呼び出し
+                await self.backup_manager.batch_upload_folder(
+                    folder_path=base_folder,
+                    account_type=account_type,
+                    encrypt=encrypt,
+                    delete_after=delete_after,
+                    username=username
+                )
+                
+                self.logger.info(f"Batch upload completed for {username}")
+            else:
+                self.logger.error("BackupManager not available for batch upload")
+                
+        except Exception as e:
+            self.logger.error(f"Batch upload failed for {username}: {e}")
+            raise
+    
+    def should_use_batch_mode(self) -> bool:
+        """バッチモードを使用するか判定"""
+        return self.enabled and self.upload_mode == 'batch'

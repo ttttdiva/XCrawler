@@ -251,12 +251,22 @@ foreach アカウント:
   2. メディアダウンロード
   3. DB保存（huggingface_urls=[]）
   4. バックアップ実行
+     - upload_mode: 'immediate': ツイートごとに個別アップロード
+     - upload_mode: 'batch': アカウントごとに一括アップロード
      - 成功: DBのhuggingface_urlsを更新
      - 失敗: そのまま（retry_upload.pyで後処理）
   
 最後に:
   5. データベースファイルをバックアップ
 ```
+
+### バッチモードの詳細
+upload_mode: 'batch'を設定した場合：
+- アカウントごとに`images/{username}/`と`videos/{username}/`を一括アップロード
+- 暗号化が有効な場合は`encrypted_images/{username}/`と`encrypted_videos/{username}/`
+- 1アカウント = 1回の`upload_folder()`呼び出し
+- 監視アカウント: 元ファイルは保持、暗号化一時ファイルは削除
+- logアカウント: アップロード後に元ファイルも削除可能
 
 ## 設定ファイル
 
@@ -266,10 +276,10 @@ huggingface_backup:
   enabled: true
   repo_name: EventMonitor_1
   include_images: true
-  backup_database: true
-  encryption:
-    enabled: true
-    remote_name: hf-crypt
+  upload_mode: 'batch'  # 'immediate' or 'batch'
+  rclone_encryption:
+    enabled: true  # 監視アカウントも含めて暗号化
+    config_path: "rclone.conf"
 ```
 
 ### monitored_accounts.csv

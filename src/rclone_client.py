@@ -11,7 +11,7 @@ from dataclasses import dataclass
 @dataclass
 class RcloneConfig:
     """Configuration for Rclone encryption"""
-    remote_name: str
+    remote_name: Optional[str] = None  # 省略時は自動検出
     config_path: Optional[str] = None
     temp_dir: Path = Path(".rclone_temp")
 
@@ -31,9 +31,16 @@ class RcloneClient:
         if not self._check_rclone():
             raise RuntimeError("rclone not found. Please install rclone first.")
         
+        # 自動検出が必要な場合
+        if not self.config.remote_name:
+            self.config.remote_name = self._auto_detect_crypt_remote()
+            if not self.config.remote_name:
+                raise RuntimeError("No crypt remote found in rclone config")
+            self.logger.info(f"Auto-detected crypt remote: {self.config.remote_name}")
+        
         # Verify remote exists
         if not self._verify_remote():
-            raise RuntimeError(f"Remote '{config.remote_name}' not found in rclone config")
+            raise RuntimeError(f"Remote '{self.config.remote_name}' not found in rclone config")
     
     def _check_rclone(self) -> bool:
         """Check if rclone is installed and available"""
@@ -48,6 +55,37 @@ class RcloneClient:
         """Verify that the configured remote exists"""
         remotes = self.list_remotes()
         return self.config.remote_name in remotes
+    
+    def _auto_detect_crypt_remote(self) -> Optional[str]:
+        """暗号化リモートを自動検出"""
+        try:
+            # rclone config showで設定を取得
+            cmd = ["rclone", "config", "show"]
+            if self.config.config_path:
+                cmd.extend(["--config", self.config.config_path])
+            
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                return None
+            
+            # type = cryptのリモートを探す
+            crypt_remotes = []
+            current_remote = None
+            for line in result.stdout.split('\n'):
+                if line.startswith('[') and line.endswith(']'):
+                    current_remote = line[1:-1]
+                elif line.strip().startswith('type = crypt'):
+                    if current_remote:
+                        crypt_remotes.append(current_remote)
+            
+            # 最初のcryptリモートを返す
+            if crypt_remotes:
+                return crypt_remotes[0]
+            
+            return None
+        except Exception as e:
+            self.logger.error(f"Failed to auto-detect crypt remote: {e}")
+            return None
     
     def _run_rclone_command(self, args: List[str], cwd: Optional[str] = None) -> subprocess.CompletedProcess:
         """Run an rclone command with proper config"""

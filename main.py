@@ -268,22 +268,53 @@ class EventMonitor:
                     if self.backup_manager.backup_config.get('enabled', False):
                         self.backup_manager._ensure_repo_exists()
                     
-                    for tweet in new_tweets:
-                        try:
-                            success = await self.backup_manager.backup_tweet_and_save(
-                                tweet, username, is_log_only=False, hydrus_client=self.hydrus_client
-                            )
-                            if success:
-                                saved_count += 1
-                                self.logger.debug(f"Successfully processed tweet {tweet['id']}")
-                            else:
+                    # アップロードモードに応じて処理を分岐
+                    if self.backup_manager.should_use_batch_mode():
+                        # バッチモード: 全体を処理後に一括アップロード
+                        self.logger.info(f"Using batch mode for monitoring account @{username}")
+                        
+                        # Hydrus連携のみ先に実行
+                        for tweet in new_tweets:
+                            if self.hydrus_client.enabled and tweet.get('local_media'):
+                                # event_tweets_onlyがFalseの場合、またはイベントツイートの場合
+                                if not self.hydrus_client.import_settings.get('event_tweets_only', True) or \
+                                   tweet['id'] in {et['id'] for et in event_tweets if 'event_tweets' in locals()}:
+                                    imported = await self.hydrus_client.import_tweet_images(
+                                        tweet,
+                                        tweet['local_media']
+                                    )
+                                    if imported:
+                                        self.logger.info(f"Imported {len(imported)} images to Hydrus for tweet {tweet['id']}")
+                        
+                        # 一括アップロード
+                        await self.backup_manager.batch_upload_folder(
+                            folder_path=Path('.'),
+                            account_type='monitoring',
+                            encrypt=self.backup_manager.rclone_client is not None,
+                            delete_after=False,  # 監視アカウントは削除しない
+                            username=username
+                        )
+                        self.logger.info(f"Batch upload completed for @{username}")
+                    else:
+                        # 即時モード: 従来通り個別処理
+                        self.logger.info(f"Using immediate mode for monitoring account @{username}")
+                        
+                        for tweet in new_tweets:
+                            try:
+                                success = await self.backup_manager.backup_tweet_and_save(
+                                    tweet, username, is_log_only=False, hydrus_client=self.hydrus_client
+                                )
+                                if success:
+                                    saved_count += 1
+                                    self.logger.debug(f"Successfully processed tweet {tweet['id']}")
+                                else:
+                                    failed_count += 1
+                                    self.logger.warning(f"Failed to process tweet {tweet['id']}")
+                            except Exception as e:
+                                self.logger.error(f"Error processing tweet {tweet['id']}: {e}")
                                 failed_count += 1
-                                self.logger.warning(f"Failed to process tweet {tweet['id']}")
-                        except Exception as e:
-                            self.logger.error(f"Error processing tweet {tweet['id']}: {e}")
-                            failed_count += 1
-                    
-                    self.logger.info(f"Processed {saved_count} tweets successfully, {failed_count} failed for @{username}")
+                        
+                        self.logger.info(f"Processed {saved_count} tweets successfully, {failed_count} failed for @{username}")
                     
             except Exception as e:
                 self.logger.error(f"Error in run_once: {e}", exc_info=True)
@@ -369,6 +400,9 @@ class EventMonitor:
         
         if not new_tweets:
             self.logger.info(f"No new tweets for log-only account @{username}")
+            # バッチモードの場合、新規がなくても既存データをアップロード
+            if self.log_only_uploader.should_use_batch_mode():
+                await self.log_only_uploader.batch_upload_account_folder(username, account_type='log')
             return
         
         self.logger.info(f"Found {len(new_tweets)} new tweets for log-only account @{username}")
@@ -406,43 +440,66 @@ class EventMonitor:
         failed_count = 0
         processed_media_count = sum(len(paths) for paths in media_paths.values())
         
-        # HFアップロード＆DB保存（1ツイートずつ）
-        for tweet in new_tweets:
-            try:
-                # HFアップロード＆DB保存（成功時のみ）
-                success = await self.backup_manager.backup_tweet_and_save(tweet, username, is_log_only=True)
-                
-                if success:
-                    saved_count += 1
-                    self.logger.debug(f"Successfully processed log-only tweet {tweet['id']}")
-                    # 注: backup_tweet_and_saveメソッド内でローカルファイルは既に削除される
-                else:
+        # アップロードモードに応じて処理を分岐
+        if self.log_only_uploader.should_use_batch_mode():
+            # バッチモード: ツイートをDBに保存してから一括アップロード
+            self.logger.info(f"Using batch mode for @{username}")
+            
+            # まずツイートをDBに保存
+            for tweet in new_tweets:
+                try:
+                    saved = self.db_manager.save_single_log_only_tweet(tweet, username)
+                    if saved:
+                        saved_count += 1
+                    else:
+                        failed_count += 1
+                except Exception as e:
+                    self.logger.error(f"Error saving log-only tweet {tweet['id']}: {e}")
                     failed_count += 1
-                    self.logger.warning(f"Failed to process log-only tweet {tweet['id']}")
-                    # 失敗時もローカルファイルを削除
+            
+            # 全ダウンロード完了後に一括アップロード
+            await self.log_only_uploader.batch_upload_account_folder(username, account_type='log')
+            
+        else:
+            # 即時モード: 従来通り1ツイートずつ処理
+            self.logger.info(f"Using immediate mode for @{username}")
+            
+            for tweet in new_tweets:
+                try:
+                    # HFアップロード＆DB保存（成功時のみ）
+                    success = await self.backup_manager.backup_tweet_and_save(tweet, username, is_log_only=True)
+                    
+                    if success:
+                        saved_count += 1
+                        self.logger.debug(f"Successfully processed log-only tweet {tweet['id']}")
+                        # 注: backup_tweet_and_saveメソッド内でローカルファイルは既に削除される
+                    else:
+                        failed_count += 1
+                        self.logger.warning(f"Failed to process log-only tweet {tweet['id']}")
+                        # 失敗時もローカルファイルを削除
+                        if tweet.get('local_media'):
+                            for media_path in tweet['local_media']:
+                                try:
+                                    media_file = Path(media_path)
+                                    if media_file.exists():
+                                        media_file.unlink()
+                                        self.logger.debug(f"Deleted local file after failure: {media_path}")
+                                except Exception as e:
+                                    self.logger.warning(f"Failed to delete local file {media_path}: {e}")
+                    
+                except Exception as e:
+                    self.logger.error(f"Error processing log-only tweet {tweet['id']}: {e}")
+                    failed_count += 1
+                    # エラー時もローカルファイルを削除
                     if tweet.get('local_media'):
                         for media_path in tweet['local_media']:
                             try:
                                 media_file = Path(media_path)
                                 if media_file.exists():
                                     media_file.unlink()
-                                    self.logger.debug(f"Deleted local file after failure: {media_path}")
-                            except Exception as e:
-                                self.logger.warning(f"Failed to delete local file {media_path}: {e}")
-                
-            except Exception as e:
-                self.logger.error(f"Error processing log-only tweet {tweet['id']}: {e}")
-                failed_count += 1
-                # エラー時もローカルファイルを削除
-                if tweet.get('local_media'):
-                    for media_path in tweet['local_media']:
-                        try:
-                            media_file = Path(media_path)
-                            if media_file.exists():
-                                media_file.unlink()
-                                self.logger.debug(f"Deleted local file after error: {media_path}")
-                        except Exception as del_e:
-                            self.logger.warning(f"Failed to delete local file {media_path}: {del_e}")
+                                    self.logger.debug(f"Deleted local file after error: {media_path}")
+                            except Exception as del_e:
+                                self.logger.warning(f"Failed to delete local file {media_path}: {del_e}")
         
         self.logger.info(
             f"Completed processing for @{username}: "
