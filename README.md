@@ -129,6 +129,16 @@ x.comのCookieをNetscape形式で`cookies/x.com_cookies.txt`にエクスポー�
 - `.env`に`TWITTER_ACCOUNT_2_TOKEN`, `TWITTER_ACCOUNT_2_CT0`等を追加
 - `cookies/x.com_cookies_2.txt`, `cookies/x.com_cookies_3.txt`等のファイルを作成
 
+#### 鍵アカウント（非公開アカウント）対応
+鍵アカウントのツイートを取得する場合、そのアカウントをフォローしているCookie/アカウントを指定：
+```yaml
+# config.yaml
+tweet_settings:
+  private_account_cookies:
+    gallery_dl_cookie: "cookies/x.com_cookies_13.txt"  # 鍵アカウントアクセス用Cookie
+    twscrape_account: 14  # .envのTWITTER_ACCOUNT_14
+```
+
 ## トラブルシューティング
 
 - **認証エラー**: Cookie（auth_token, ct0）の有効期限を確認

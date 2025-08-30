@@ -268,8 +268,15 @@ class EventMonitor:
                     if self.backup_manager.backup_config.get('enabled', False):
                         self.backup_manager._ensure_repo_exists()
                     
+                    # 初回処理かどうかを判定（DBに該当アカウントのツイートが1件もない場合）
+                    existing_count = self.db_manager.get_tweet_count_for_user(username)
+                    is_first_run = (existing_count == 0)
+                    
+                    if is_first_run:
+                        self.logger.info(f"First time processing @{username} (no existing tweets in DB)")
+                    
                     # アップロードモードに応じて処理を分岐
-                    if self.backup_manager.should_use_batch_mode():
+                    if self.backup_manager.should_use_batch_mode(is_first_run=is_first_run):
                         # バッチモード: 全体を処理後に一括アップロード
                         self.logger.info(f"Using batch mode for monitoring account @{username}")
                         
@@ -302,7 +309,8 @@ class EventMonitor:
                         for tweet in new_tweets:
                             try:
                                 success = await self.backup_manager.backup_tweet_and_save(
-                                    tweet, username, is_log_only=False, hydrus_client=self.hydrus_client
+                                    tweet, username, is_log_only=False, hydrus_client=self.hydrus_client,
+                                    is_first_run=is_first_run
                                 )
                                 if success:
                                     saved_count += 1
@@ -315,6 +323,17 @@ class EventMonitor:
                                 failed_count += 1
                         
                         self.logger.info(f"Processed {saved_count} tweets successfully, {failed_count} failed for @{username}")
+                        
+                        # 初回実行時はimmediateモードでもバッチアップロードを実行
+                        if is_first_run and self.backup_manager.backup_config.get('enabled', False):
+                            self.logger.info(f"First run in immediate mode - executing batch upload for @{username}")
+                            await self.backup_manager.batch_upload_folder(
+                                folder_path=Path('.'),
+                                account_type='monitoring',
+                                encrypt=self.backup_manager.rclone_client is not None,
+                                delete_after=False,
+                                username=username
+                            )
                     
             except Exception as e:
                 self.logger.error(f"Error in run_once: {e}", exc_info=True)
@@ -440,8 +459,15 @@ class EventMonitor:
         failed_count = 0
         processed_media_count = sum(len(paths) for paths in media_paths.values())
         
+        # 初回処理かどうかを判定（DBに該当アカウントのツイートが1件もない場合）
+        existing_count = self.db_manager.get_log_only_tweet_count_for_user(username)
+        is_first_run = (existing_count == 0)
+        
+        if is_first_run:
+            self.logger.info(f"First time processing log account @{username} (no existing tweets in DB)")
+        
         # アップロードモードに応じて処理を分岐
-        if self.log_only_uploader.should_use_batch_mode():
+        if self.log_only_uploader.should_use_batch_mode(is_first_run=is_first_run):
             # バッチモード: ツイートをDBに保存してから一括アップロード
             self.logger.info(f"Using batch mode for @{username}")
             
@@ -467,7 +493,9 @@ class EventMonitor:
             for tweet in new_tweets:
                 try:
                     # HFアップロード＆DB保存（成功時のみ）
-                    success = await self.backup_manager.backup_tweet_and_save(tweet, username, is_log_only=True)
+                    success = await self.backup_manager.backup_tweet_and_save(
+                        tweet, username, is_log_only=True, is_first_run=is_first_run
+                    )
                     
                     if success:
                         saved_count += 1
@@ -500,6 +528,11 @@ class EventMonitor:
                                     self.logger.debug(f"Deleted local file after error: {media_path}")
                             except Exception as del_e:
                                 self.logger.warning(f"Failed to delete local file {media_path}: {del_e}")
+            
+            # 初回実行時はimmediateモードでもバッチアップロードを実行
+            if is_first_run and self.log_only_uploader.enabled:
+                self.logger.info(f"First run in immediate mode - executing batch upload for log account @{username}")
+                await self.log_only_uploader.batch_upload_account_folder(username, account_type='log')
         
         self.logger.info(
             f"Completed processing for @{username}: "

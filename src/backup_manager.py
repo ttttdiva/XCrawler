@@ -294,7 +294,7 @@ class BackupManager:
             self.logger.error(f"Failed to ensure repository exists: {e}")
             raise
     
-    async def backup_tweet_and_save(self, tweet: Dict[str, Any], username: str, is_log_only: bool = False, hydrus_client=None) -> bool:
+    async def backup_tweet_and_save(self, tweet: Dict[str, Any], username: str, is_log_only: bool = False, hydrus_client=None, is_first_run: bool = False) -> bool:
         """単一ツイートのメディアをHugging Faceにバックアップし、成功したらDBに保存
         
         Args:
@@ -302,10 +302,25 @@ class BackupManager:
             username: ユーザー名
             is_log_only: Trueの場合log_only_tweetsテーブル、Falseの場合all_tweetsテーブル
             hydrus_client: HydrusClient インスタンス（監視アカウントの場合に使用）
+            is_first_run: 初回処理かどうか（DBにデータがない場合）
             
         Returns:
             bool: 処理成功の場合True
         """
+        
+        # 初回処理の場合はバッチモードを強制（immediateモードでも）
+        if is_first_run and self.upload_mode == 'immediate':
+            # 初回はバッチとして処理するため、ここでは保存のみ
+            if self.db_manager:
+                if is_log_only:
+                    saved = self.db_manager.save_single_log_only_tweet(tweet, username)
+                else:
+                    saved = self.db_manager.save_single_tweet(tweet, username)
+                
+                if not saved:
+                    self.logger.error(f"Failed to save tweet {tweet.get('id')} to database")
+                    return False
+            return True
         
         # logアカウントは設定に関わらず常にアップロード
         if not is_log_only and not self.backup_config.get('enabled', False):
@@ -768,6 +783,162 @@ class BackupManager:
             
         except Exception as e:
             self.logger.error(f"Failed to update tweet HF URLs: {e}")
+    
+    def _update_database_urls_batch(self, username: str, uploaded_folder: Path, account_type: str = 'monitoring'):
+        """バッチアップロード後にデータベースのHuggingFace URLsを更新
+        
+        Args:
+            username: アカウント名
+            uploaded_folder: アップロードされたフォルダのパス
+            account_type: 'monitoring' または 'log'
+        """
+        try:
+            import pysqlite3 as sqlite3
+            conn = sqlite3.connect('data/eventmonitor.db')
+            cursor = conn.cursor()
+            
+            updated_count = 0
+            
+            # 適切なテーブルを選択
+            if account_type == 'log':
+                table_name = 'log_only_tweets'
+                # log_only_tweetsの場合はuploaded_to_hfフラグも更新する必要がある
+            else:
+                table_name = 'all_tweets'
+            
+            # images/username/とvideos/username/内のファイルを処理
+            for media_type in ['images', 'videos']:
+                media_dir = uploaded_folder / media_type / username
+                if not media_dir.exists():
+                    continue
+                    
+                for file_path in media_dir.glob('*'):
+                    if not file_path.is_file():
+                        continue
+                    
+                    # ファイル名からツイートIDを抽出
+                    tweet_id = file_path.stem.split('_')[0]
+                    
+                    # HuggingFace URLを構築
+                    hf_url = f"https://huggingface.co/datasets/{self.full_repo_name}/resolve/main/{media_type}/{username}/{file_path.name}"
+                    
+                    # 既存のHuggingFace URLsを取得
+                    cursor.execute(f'SELECT huggingface_urls FROM {table_name} WHERE id = ?', (tweet_id,))
+                    result = cursor.fetchone()
+                    
+                    if result:
+                        existing_urls = json.loads(result[0]) if result[0] else []
+                        
+                        # 新しいURLを追加（重複を避ける）
+                        if hf_url not in existing_urls:
+                            existing_urls.append(hf_url)
+                            
+                            # データベースを更新
+                            if account_type == 'log':
+                                # log_only_tweetsの場合はuploaded_to_hfもTrueに更新
+                                cursor.execute(f'UPDATE {table_name} SET huggingface_urls = ?, uploaded_to_hf = 1 WHERE id = ?', 
+                                             (json.dumps(existing_urls), tweet_id))
+                            else:
+                                cursor.execute(f'UPDATE {table_name} SET huggingface_urls = ? WHERE id = ?', 
+                                             (json.dumps(existing_urls), tweet_id))
+                            updated_count += 1
+            
+            conn.commit()
+            conn.close()
+            
+            if updated_count > 0:
+                self.logger.info(f"Updated HuggingFace URLs for {updated_count} tweets in {table_name} (batch upload)")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to update database URLs in batch: {e}")
+    
+    def _update_database_urls_batch_encrypted(self, username: str, encrypted_folder: Path, account_type: str = 'monitoring'):
+        """暗号化バッチアップロード後にデータベースのHuggingFace URLsを更新
+        
+        Args:
+            username: アカウント名
+            encrypted_folder: 暗号化されたフォルダのパス
+            account_type: 'monitoring' または 'log'
+        """
+        try:
+            import pysqlite3 as sqlite3
+            conn = sqlite3.connect('data/eventmonitor.db')
+            cursor = conn.cursor()
+            
+            updated_count = 0
+            
+            # 適切なテーブルを選択
+            if account_type == 'log':
+                table_name = 'log_only_tweets'
+            else:
+                table_name = 'all_tweets'
+            
+            # encrypted_images/username/とencrypted_videos/username/内のファイルを処理
+            for media_type, encrypted_type in [('images', 'encrypted_images'), ('videos', 'encrypted_videos')]:
+                encrypted_dir = encrypted_folder / encrypted_type / username
+                if not encrypted_dir.exists():
+                    continue
+                    
+                # マッピングファイルを読み込み
+                mapping_file = encrypted_folder / "encryption_mapping.json"
+                file_mappings = {}
+                if mapping_file.exists():
+                    with open(mapping_file, 'r', encoding='utf-8') as f:
+                        file_mappings = json.load(f)
+                
+                for encrypted_file in encrypted_dir.glob('*'):
+                    if not encrypted_file.is_file():
+                        continue
+                    
+                    # 元のファイル名を取得（マッピングから逆引き）
+                    original_filename = None
+                    for orig_path, enc_name in file_mappings.items():
+                        if enc_name == encrypted_file.name:
+                            # orig_pathからファイル名を抽出
+                            original_filename = Path(orig_path).name
+                            break
+                    
+                    if not original_filename:
+                        # マッピングにない場合は暗号化ファイル名から推測（簡易的）
+                        # 通常、暗号化後も元のファイル名構造は保持される
+                        original_filename = encrypted_file.name
+                    
+                    # ツイートIDを抽出
+                    tweet_id = original_filename.split('_')[0]
+                    
+                    # HuggingFace URLを構築（暗号化済みファイルのパス）
+                    # path_in_repo="batch_encrypted/{username}" で、その中に encrypted_images/username/file.enc がある
+                    hf_url = f"https://huggingface.co/datasets/{self.full_repo_name}/resolve/main/batch_encrypted/{username}/{encrypted_type}/{username}/{encrypted_file.name}"
+                    
+                    # 既存のHuggingFace URLsを取得
+                    cursor.execute(f'SELECT huggingface_urls FROM {table_name} WHERE id = ?', (tweet_id,))
+                    result = cursor.fetchone()
+                    
+                    if result:
+                        existing_urls = json.loads(result[0]) if result[0] else []
+                        
+                        # 新しいURLを追加（重複を避ける）
+                        if hf_url not in existing_urls:
+                            existing_urls.append(hf_url)
+                            
+                            # データベースを更新
+                            if account_type == 'log':
+                                # log_only_tweetsの場合はuploaded_to_hfもTrueに更新
+                                cursor.execute(f'UPDATE {table_name} SET huggingface_urls = ?, uploaded_to_hf = 1 WHERE id = ?', 
+                                             (json.dumps(existing_urls), tweet_id))
+                            else:
+                                cursor.execute(f'UPDATE {table_name} SET huggingface_urls = ? WHERE id = ?', 
+                                             (json.dumps(existing_urls), tweet_id))
+                            updated_count += 1
+            
+            conn.commit()
+            conn.close()
+            
+            if updated_count > 0:
+                self.logger.info(f"Updated HuggingFace URLs for {updated_count} tweets in {table_name} (encrypted batch upload)")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to update database URLs in encrypted batch: {e}")
     
     def _update_tweet_hf_urls_batch(self, tweet_id: str, hf_urls: List[str], is_log_only: bool = False):
         """複数のHuggingFace URLを一度に更新
@@ -1440,8 +1611,19 @@ class BackupManager:
         except Exception as e:
             self.logger.error(f"Failed to save video encryption mapping: {e}")
     
-    def should_use_batch_mode(self) -> bool:
-        """バッチモードを使用するか判定"""
+    def should_use_batch_mode(self, is_first_run: bool = False) -> bool:
+        """バッチモードを使用するか判定
+        
+        Args:
+            is_first_run: 初回処理かどうか（DBにデータがない場合）
+        
+        Returns:
+            bool: バッチモードを使用する場合True
+        """
+        # 初回処理の場合は常にバッチモード
+        if is_first_run:
+            return self.backup_config.get('enabled', False)
+        # 通常はupload_modeの設定に従う
         return self.backup_config.get('enabled', False) and self.upload_mode == 'batch'
     
     async def batch_upload_folder(self, folder_path: Path, account_type: str = 'monitoring', 
@@ -1467,10 +1649,10 @@ class BackupManager:
             
             if encrypt and self.rclone_client:
                 # 暗号化が有効かつrclone_clientが初期化されている場合
-                await self._batch_upload_encrypted_folder(folder_path, username, delete_after)
+                await self._batch_upload_encrypted_folder(folder_path, username, delete_after, account_type)
             else:
                 # 暗号化が無効またはrclone_clientが未初期化の場合
-                await self._batch_upload_plain_folder(folder_path, username, delete_after)
+                await self._batch_upload_plain_folder(folder_path, username, delete_after, account_type)
                 
             self.logger.info(f"Completed batch upload for {folder_path}")
             
@@ -1479,7 +1661,7 @@ class BackupManager:
             raise
     
     async def _batch_upload_plain_folder(self, folder_path: Path, username: str = None, 
-                                        delete_after: bool = False):
+                                        delete_after: bool = False, account_type: str = 'monitoring'):
         """暗号化なしでフォルダを一括アップロード（upload_folder使用）"""
         if not username:
             self.logger.error("Username is required for batch upload")
@@ -1548,6 +1730,9 @@ class BackupManager:
                             raise  # エラーを再発生
                 
                 self.logger.info(f"Successfully uploaded media for account {username}")
+                
+                # データベースのHuggingFace URLsを更新
+                self._update_database_urls_batch(username, temp_path, account_type=account_type)
             
             # フォルダ削除（オプション）
             if delete_after:
@@ -1563,11 +1748,11 @@ class BackupManager:
             raise
     
     async def _batch_upload_encrypted_folder(self, folder_path: Path, username: str = None,
-                                            delete_after: bool = True):
+                                            delete_after: bool = True, account_type: str = 'monitoring'):
         """フォルダを暗号化してアップロード（upload_folder使用）"""
         if not self.rclone_client:
             self.logger.error("Rclone encryption not configured for batch upload")
-            return await self._batch_upload_plain_folder(folder_path, username, delete_after)
+            return await self._batch_upload_plain_folder(folder_path, username, delete_after, account_type)
         
         if not username:
             self.logger.error("Username is required for batch upload")
@@ -1675,6 +1860,9 @@ class BackupManager:
                         raise  # エラーを再発生
             
             self.logger.info(f"Successfully uploaded encrypted folder for {username}")
+            
+            # データベースのHuggingFace URLsを更新（暗号化フォルダの場合）
+            self._update_database_urls_batch_encrypted(username, encrypted_folder, account_type=account_type)
             
             # 削除処理
             if delete_after:

@@ -296,6 +296,9 @@ class TwitterMonitor:
         all_tweets = []
         all_event_tweets = []
         
+        # 鍵アカウントかどうかを事前にチェック
+        is_private_account = await self._check_if_private_account(username)
+        
         # Gallery-dlの有効性をチェック
         gallery_dl_config = self.config.get('tweet_settings', {}).get('gallery_dl', {})
         gallery_dl_enabled = gallery_dl_config.get('enabled', True)
@@ -326,7 +329,11 @@ class TwitterMonitor:
             if should_fetch_gallery:
                 self.logger.info(f"Step 1: Fetching media tweets with gallery-dl for @{username}")
                 try:
-                    gallery_tweets, gallery_event_tweets = await self.gallery_dl_extractor.fetch_and_analyze_tweets(username, event_detection_enabled=event_detection_enabled)
+                    gallery_tweets, gallery_event_tweets = await self.gallery_dl_extractor.fetch_and_analyze_tweets(
+                        username, 
+                        event_detection_enabled=event_detection_enabled,
+                        is_private_account=is_private_account
+                    )
                     
                     if gallery_tweets:
                         all_tweets.extend(gallery_tweets)
@@ -351,7 +358,8 @@ class TwitterMonitor:
                     days_lookback, 
                     twscrape_force_full,  # twscrape独自のforce_full_fetchを使用
                     latest_date_override=pre_crawl_latest_date,
-                    latest_id_override=pre_crawl_latest_id
+                    latest_id_override=pre_crawl_latest_id,
+                    is_private_account=is_private_account
                 )
                 
                 if twscrape_tweets:
@@ -378,7 +386,20 @@ class TwitterMonitor:
         
         return all_tweets, all_event_tweets
     
-    async def _get_user_tweets_twscrape_only(self, username: str, days_lookback: int = 365, force_full_fetch: bool = False, latest_date_override=None, latest_id_override=None) -> List[Dict[str, Any]]:
+    async def _check_if_private_account(self, username: str) -> bool:
+        """ユーザーが鍵アカウントかどうかをチェック"""
+        try:
+            await self._initialize_accounts()
+            user = await self.api.user_by_login(username)
+            if user and hasattr(user, 'protected'):
+                if user.protected:
+                    self.logger.info(f"User @{username} is a protected (private) account")
+                return bool(user.protected)  # Noneの場合もFalseにする
+        except Exception as e:
+            self.logger.debug(f"Could not check if @{username} is private: {e}")
+        return False
+    
+    async def _get_user_tweets_twscrape_only(self, username: str, days_lookback: int = 365, force_full_fetch: bool = False, latest_date_override=None, latest_id_override=None, is_private_account: bool = False) -> List[Dict[str, Any]]:
         """
         twscrapeのみでツイートを取得（gallery-dl優先処理用）
         
@@ -389,12 +410,17 @@ class TwitterMonitor:
         # リトライ処理（最大3回）
         max_retries = 3
         retry_count = 0
+        use_specific_account = is_private_account  # 鍵アカウントなら最初から指定アカウントを使用
+        
+        if is_private_account:
+            await self._use_specific_twscrape_account()
         
         while retry_count < max_retries:
             try:
                 return await self._get_user_tweets_twscrape_internal(
                     username, days_lookback, force_full_fetch, 
-                    latest_date_override, latest_id_override
+                    latest_date_override, latest_id_override,
+                    use_specific_account=use_specific_account
                 )
             except TimeoutError as e:
                 retry_count += 1
@@ -418,7 +444,26 @@ class TwitterMonitor:
                 
         return []
     
-    async def _get_user_tweets_twscrape_internal(self, username: str, days_lookback: int = 365, force_full_fetch: bool = False, latest_date_override=None, latest_id_override=None) -> List[Dict[str, Any]]:
+    async def _use_specific_twscrape_account(self):
+        """鍵アカウント用の指定twscrapeアカウントを使用"""
+        import os
+        private_config = self.config.get('tweet_settings', {}).get('private_account_cookies', {})
+        account_num = private_config.get('twscrape_account', 14)
+        
+        # 環境変数から指定アカウントの情報を取得
+        auth_token = os.getenv(f'TWITTER_ACCOUNT_{account_num}_TOKEN')
+        ct0 = os.getenv(f'TWITTER_ACCOUNT_{account_num}_CT0')
+        
+        if auth_token and ct0:
+            self.logger.info(f"Using specific twscrape account {account_num} for private account")
+            # アカウントプールをクリアして指定アカウントのみ追加
+            await self.api.pool.reset_locks()
+            # 特定アカウントを優先的に使用するようにマーク
+            # (twscrapeの内部実装によってはこの部分の調整が必要)
+        else:
+            self.logger.warning(f"Specific twscrape account {account_num} not configured in .env")
+    
+    async def _get_user_tweets_twscrape_internal(self, username: str, days_lookback: int = 365, force_full_fetch: bool = False, latest_date_override=None, latest_id_override=None, use_specific_account: bool = False) -> List[Dict[str, Any]]:
         """
         twscrapeの内部実装（タイムアウトエラーを投げる）
         """

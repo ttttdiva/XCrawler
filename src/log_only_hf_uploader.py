@@ -711,6 +711,17 @@ Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             self.logger.error(f"Batch upload failed for {username}: {e}")
             raise
     
-    def should_use_batch_mode(self) -> bool:
-        """バッチモードを使用するか判定"""
+    def should_use_batch_mode(self, is_first_run: bool = False) -> bool:
+        """バッチモードを使用するか判定
+        
+        Args:
+            is_first_run: 初回処理かどうか（DBにデータがない場合）
+        
+        Returns:
+            bool: バッチモードを使用する場合True
+        """
+        # 初回処理の場合は常にバッチモード
+        if is_first_run:
+            return self.enabled
+        # 通常はupload_modeの設定に従う
         return self.enabled and self.upload_mode == 'batch'

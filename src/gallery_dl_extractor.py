@@ -35,24 +35,43 @@ class GalleryDLExtractor:
         # ラッパースクリプトのパス
         self.wrapper_path = Path(__file__).parent / 'gallery_dl_wrapper.py'
         
-    def fetch_media_tweets(self, username: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    def fetch_media_tweets(self, username: str, limit: Optional[int] = None, is_private_account: bool = False) -> List[Dict[str, Any]]:
         """
         指定ユーザーのメディア付きツイートを取得
         
         Args:
             username: Twitter username
             limit: 取得件数制限（Noneで全件）
+            is_private_account: 鍵アカウントの場合True（指定Cookieを使用）
             
         Returns:
             ツイート情報のリスト
         """
         url = f"https://x.com/{username}/media"
         
-        # Cookieファイルを取得（ローテーション）
-        cookie_file = self.cookie_rotator.get_next_cookie()
-        if not cookie_file:
-            cookie_file = self.default_cookie_file
-            self.logger.warning("No cookie available for rotation, using default")
+        # 鍵アカウントの場合は指定のCookieを使用
+        if is_private_account:
+            specific_cookie = self.config.get('tweet_settings', {}).get('private_account_cookies', {}).get('gallery_dl_cookie')
+            if specific_cookie:
+                cookie_file = Path(specific_cookie)
+                if cookie_file.exists():
+                    self.logger.info(f"Using specific cookie for private account @{username}: {cookie_file}")
+                else:
+                    self.logger.warning(f"Specific cookie not found: {specific_cookie}, falling back to rotation")
+                    cookie_file = self.cookie_rotator.get_next_cookie()
+                    if not cookie_file:
+                        cookie_file = self.default_cookie_file
+            else:
+                self.logger.warning("No specific cookie configured for private accounts, using rotation")
+                cookie_file = self.cookie_rotator.get_next_cookie()
+                if not cookie_file:
+                    cookie_file = self.default_cookie_file
+        else:
+            # Cookieファイルを取得（ローテーション）
+            cookie_file = self.cookie_rotator.get_next_cookie()
+            if not cookie_file:
+                cookie_file = self.default_cookie_file
+                self.logger.warning("No cookie available for rotation, using default")
         
         # gallery-dlコマンドを構築（シンプルな配列で）
         cmd = [
@@ -497,9 +516,13 @@ class GalleryDLExtractor:
     def _move_to_images_dir(self, files: List[Path], username: str):
         """ダウンロードしたファイルを適切なディレクトリに移動（画像→images、動画→videos）"""
         try:
+            # 設定からパスを取得（デフォルトは従来のパス）
+            images_base = Path(self.config.get('media_storage', {}).get('images_path', 'images'))
+            videos_base = Path(self.config.get('media_storage', {}).get('videos_path', 'videos'))
+            
             # ディレクトリを作成
-            images_dir = Path('images') / username
-            videos_dir = Path('videos') / username
+            images_dir = images_base / username
+            videos_dir = videos_base / username
             images_dir.mkdir(parents=True, exist_ok=True)
             videos_dir.mkdir(parents=True, exist_ok=True)
             
@@ -567,9 +590,13 @@ class GalleryDLExtractor:
         """ダウンロードしたファイルを適切なディレクトリに移動し、マッピングを返す"""
         mapping = {}
         try:
+            # 設定からパスを取得（デフォルトは従来のパス）
+            images_base = Path(self.config.get('media_storage', {}).get('images_path', 'images'))
+            videos_base = Path(self.config.get('media_storage', {}).get('videos_path', 'videos'))
+            
             # ディレクトリを作成
-            images_dir = Path('images') / username
-            videos_dir = Path('videos') / username
+            images_dir = images_base / username
+            videos_dir = videos_base / username
             images_dir.mkdir(parents=True, exist_ok=True)
             videos_dir.mkdir(parents=True, exist_ok=True)
             
@@ -675,7 +702,7 @@ class GalleryDLExtractor:
         
         return sorted_tweets
     
-    async def fetch_and_analyze_tweets(self, username: str, limit: Optional[int] = None, event_detection_enabled: bool = True) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    async def fetch_and_analyze_tweets(self, username: str, limit: Optional[int] = None, event_detection_enabled: bool = True, is_private_account: bool = False) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         gallery-dlでツイートを取得してイベント判定も実行
         
@@ -683,12 +710,13 @@ class GalleryDLExtractor:
             username: Twitter username
             limit: 取得件数制限（Noneで全件）
             event_detection_enabled: このアカウントでイベント検知を行うか
+            is_private_account: 鍵アカウントの場合True（指定Cookieを使用）
             
         Returns:
             (全ツイート, イベント関連ツイート)のタプル
         """
         # gallery-dlでツイートを取得
-        tweets = self.fetch_media_tweets(username, limit)
+        tweets = self.fetch_media_tweets(username, limit, is_private_account)
         
         if not tweets:
             self.logger.info(f"No tweets fetched for @{username}")

@@ -655,6 +655,34 @@ class DatabaseManager:
         finally:
             session.close()
     
+    def get_tweet_count_for_user(self, username: str) -> int:
+        """指定ユーザーのツイート数を取得（all_tweetsテーブル）"""
+        session = self._get_session()
+        try:
+            count = session.query(AllTweets).filter(
+                AllTweets.username == username
+            ).count()
+            return count
+        except SQLAlchemyError as e:
+            self.logger.error(f"Failed to get tweet count for {username}: {e}")
+            return 0
+        finally:
+            session.close()
+    
+    def get_log_only_tweet_count_for_user(self, username: str) -> int:
+        """指定ユーザーのログ専用ツイート数を取得（log_only_tweetsテーブル）"""
+        session = self._get_session()
+        try:
+            count = session.query(LogOnlyTweet).filter(
+                LogOnlyTweet.username == username
+            ).count()
+            return count
+        except SQLAlchemyError as e:
+            self.logger.error(f"Failed to get log-only tweet count for {username}: {e}")
+            return 0
+        finally:
+            session.close()
+    
     def get_log_only_tweets(self, username: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
         """ログ専用ツイートを取得"""
         session = self._get_session()

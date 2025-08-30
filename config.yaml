@@ -36,6 +36,8 @@ tweet_settings:
     enabled: true
     # 強制的に全ツイートを取得するか（新着チェックをスキップ）
     force_full_fetch: false
+    # 一度にダウンロードする最大ツイート数（大量の場合は分割）
+    max_batch_size: 100
   
   # twscrape設定（テキストのみツイート取得）
   twscrape:
@@ -43,6 +45,13 @@ tweet_settings:
     enabled: true
     # 強制的に全ツイートを取得するか（効率化を無視）
     force_full_fetch: false
+  
+  # 鍵アカウント用の指定Cookie設定
+  private_account_cookies:
+    # gallery-dl用の指定Cookieファイル（鍵アカウントでリトライ時に使用）
+    gallery_dl_cookie: "cookies/x.com_cookies.txt"
+    # twscrape用の指定アカウント（.envのTWITTER_ACCOUNT_番号）
+    twscrape_account: 1
 
 # イベント判定設定
 event_detection:
@@ -88,15 +97,15 @@ huggingface_backup:
   # バックアップを有効にするか
   enabled: false
   # リポジトリ名（config.yamlで設定）
-  repo_name: "hfusername/XCrawler_1"
+  repo_name: "Sageen/EventMonitor_1"
   # 画像も含めるか
   include_images: true
   # アップロードモード ('immediate': 即時アップロード, 'batch': 全ダウンロード後一括アップロード)
-  upload_mode: 'batch'
+  upload_mode: 'immediate'
   # rclone暗号化設定
   rclone_encryption:
     # 暗号化を有効にするか
-    enabled: true
+    enabled: false
     # rclone設定ファイルのパス（省略時はデフォルトのrclone.conf）
     config_path: "rclone.conf"
   # レート制限時の待機をスキップするか（falseで適切に待機）
@@ -145,6 +154,13 @@ system:
   # 実行間隔（分）
   check_interval: 60
 
+# メディア保存設定
+media_storage:
+  # 画像ファイルの保存パス（例: "/mnt/f/Crawler/images"）
+  images_path: "images"
+  # 動画ファイルの保存パス（例: "/mnt/f/Crawler/videos"）
+  videos_path: "videos"
+
 # ログ専用アカウント設定
 log_only_accounts:
   # 機能を有効にするか
@@ -154,10 +170,10 @@ log_only_accounts:
   # 一度に処理するツイート数
   batch_size: 50
   # アップロードモード ('immediate': 即時アップロード, 'batch': 全ダウンロード後一括アップロード)
-  upload_mode: 'batch'
+  upload_mode: 'immediate'
   # バッチモード用設定
   batch_mode:
     # 暗号化を有効にするか（logアカウントのみ）
-    encrypt_before_upload: true
+    encrypt_before_upload: false
     # アップロード後にフォルダを削除するか
     delete_after_batch_upload: false
